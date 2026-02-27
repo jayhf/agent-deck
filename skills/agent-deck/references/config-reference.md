@@ -173,6 +173,25 @@ remove_orphans = true   # Delete logs for removed sessions
 
 **Logs location:** `~/.agent-deck/logs/agentdeck_<session>_<id>.log`
 
+## [worktree] Section
+
+Git worktree preferences.
+
+```toml
+[worktree]
+auto_cleanup = true               # Remove worktree when session is deleted
+default_location = "subdirectory" # "sibling", "subdirectory", or custom path
+branch_prefix = "feature/"        # Prefix for auto-generated branch names
+# path_template = "~/worktrees/{repo-name}/{branch}"  # Custom path template (overrides default_location)
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `auto_cleanup` | bool | `true` | Remove worktree directory when session is deleted. |
+| `default_location` | string | `"subdirectory"` | Where to create worktrees: `"sibling"`, `"subdirectory"` (inside `.worktrees/`), or a custom path. |
+| `branch_prefix` | string | `"feature/"` | Prefix for auto-generated branch names (e.g. `"fix/"`, `"feat/"`). |
+| `path_template` | string | none | Custom path template with variables: `{repo-name}`, `{repo-root}`, `{branch}`, `{session-id}`. Overrides `default_location`. |
+
 ## [updates] Section
 
 Auto-update settings.
