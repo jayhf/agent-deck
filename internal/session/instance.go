@@ -3802,6 +3802,7 @@ func (i *Instance) GetHookStatus() (string, bool) {
 func (i *Instance) ClearHookStatus() {
 	i.mu.Lock()
 	i.hookStatus = ""
+	i.hookEvent = ""
 	i.hookLastUpdate = time.Time{}
 	i.mu.Unlock()
 
@@ -3811,6 +3812,15 @@ func (i *Instance) ClearHookStatus() {
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// IsWaitingForPermission returns true if the instance is blocked on a Claude
+// permission prompt (PermissionRequest or Notification with permission_prompt matcher).
+func (i *Instance) IsWaitingForPermission() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hookStatus == "waiting" &&
+		(i.hookEvent == "PermissionRequest" || i.hookEvent == "Notification")
 }
 
 // ForceNextStatusCheck clears the idle polling optimization so the next
