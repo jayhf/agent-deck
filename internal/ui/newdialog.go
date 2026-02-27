@@ -61,7 +61,8 @@ type NewDialog struct {
 	// Worktree support.
 	worktreeEnabled bool
 	branchInput     textinput.Model
-	branchAutoSet   bool // true if branch was auto-derived from session name.
+	branchAutoSet   bool   // true if branch was auto-derived from session name.
+	branchPrefix    string // prefix for auto-generated branch names (from config).
 	// Docker sandbox support.
 	sandboxEnabled    bool
 	inheritedExpanded bool             // whether the inherited settings section is expanded.
@@ -180,6 +181,7 @@ func NewNewDialog() *NewDialog {
 		parentGroupPath: "default",
 		parentGroupName: "default",
 		worktreeEnabled: false,
+		branchPrefix:    session.GetWorktreeSettings().BranchPrefix,
 	}
 	dlg.updateToolOptions() // Also calls rebuildFocusTargets.
 	return dlg
@@ -237,6 +239,10 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 	}
+	// Load branch prefix from worktree config.
+	wtSettings := session.GetWorktreeSettings()
+	d.branchPrefix = wtSettings.BranchPrefix
+	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
 	d.rebuildFocusTargets()
 }
 
@@ -476,7 +482,7 @@ func (d *NewDialog) autoBranchFromName() {
 	if name == "" {
 		return
 	}
-	branch := "feature/" + name
+	branch := d.branchPrefix + name
 	d.branchInput.SetValue(branch)
 	d.branchAutoSet = true
 }

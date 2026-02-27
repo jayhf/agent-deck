@@ -526,6 +526,10 @@ type WorktreeSettings struct {
 	// Unknown variables like {foo} are left as-is in the path.
 	// If set, overrides DefaultLocation.
 	PathTemplate *string `toml:"path_template"`
+
+	// BranchPrefix: prefix for auto-generated branch names (e.g., "jf/", "feature/").
+	// Default: "feature/"
+	BranchPrefix string `toml:"branch_prefix"`
 }
 
 // Template returns the path template if set, or empty string if nil.
@@ -1153,6 +1157,7 @@ func GetWorktreeSettings() WorktreeSettings {
 		return WorktreeSettings{
 			DefaultLocation: "subdirectory",
 			AutoCleanup:     true,
+			BranchPrefix:    "feature/",
 		}
 	}
 
@@ -1165,6 +1170,9 @@ func GetWorktreeSettings() WorktreeSettings {
 	// We detect if section was not present by checking if DefaultLocation is empty
 	if config.Worktree.DefaultLocation == "" {
 		settings.AutoCleanup = true
+	}
+	if settings.BranchPrefix == "" {
+		settings.BranchPrefix = "feature/"
 	}
 
 	return settings
