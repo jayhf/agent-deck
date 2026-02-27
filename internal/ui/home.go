@@ -23,6 +23,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	ghub "github.com/asheshgoplani/agent-deck/internal/github"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
@@ -226,6 +227,13 @@ type Home struct {
 	worktreeDirtyCache   map[string]bool      // sessionID -> isDirty
 	worktreeDirtyCacheTs map[string]time.Time // sessionID -> cache timestamp
 	worktreeDirtyMu      sync.Mutex           // Protects dirty cache maps
+
+	// GitHub PR info cache (lazy, 45s TTL)
+	prInfoCache   map[string]*ghub.PRInfo // sessionID -> PR info (nil = no PR)
+	prInfoCacheTs map[string]time.Time    // sessionID -> fetch timestamp
+	prInfoMu      sync.Mutex             // Protects PR info cache maps
+	ghInstalled   bool
+	ghCheckedOnce sync.Once
 
 	// Memory management: periodic cache pruning
 	lastCachePrune time.Time
@@ -469,6 +477,13 @@ type worktreeDirtyCheckMsg struct {
 	err       error
 }
 
+// prInfoCheckMsg is sent when an async GitHub PR info fetch completes
+type prInfoCheckMsg struct {
+	sessionID string
+	prInfo    *ghub.PRInfo
+	err       error
+}
+
 // worktreeFinishResultMsg is sent when the worktree finish operation completes
 type worktreeFinishResultMsg struct {
 	sessionID    string
@@ -564,6 +579,8 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		lastLogActivity:      make(map[string]time.Time),
 		worktreeDirtyCache:   make(map[string]bool),
 		worktreeDirtyCacheTs: make(map[string]time.Time),
+		prInfoCache:          make(map[string]*ghub.PRInfo),
+		prInfoCacheTs:        make(map[string]time.Time),
 		statusTrigger:        make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
 		statusWorkerDone:     make(chan struct{}),
 		logUpdateChan:        make(chan *session.Instance, 100), // Buffered to absorb bursts
@@ -1338,6 +1355,16 @@ func (h *Home) pruneAnalyticsCache() {
 
 	// Prune MCP info cache (entries older than 10 minutes)
 	session.PruneMCPCache(maxAge)
+
+	// Prune PR info cache
+	h.prInfoMu.Lock()
+	for id, t := range h.prInfoCacheTs {
+		if now.Sub(t) > maxAge {
+			delete(h.prInfoCache, id)
+			delete(h.prInfoCacheTs, id)
+		}
+	}
+	h.prInfoMu.Unlock()
 }
 
 // setError sets an error with timestamp for auto-dismiss
@@ -3022,6 +3049,30 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+			// GitHub PR info check (lazy, 45s TTL)
+			h.ghCheckedOnce.Do(func() { h.ghInstalled = ghub.GHInstalled() })
+			if h.ghInstalled && inst.IsWorktree() && inst.WorktreeBranch != "" {
+				h.prInfoMu.Lock()
+				prTs, hasPR := h.prInfoCacheTs[inst.ID]
+				needsPR := !hasPR || time.Since(prTs) > 45*time.Second
+				if needsPR {
+					h.prInfoCacheTs[inst.ID] = time.Now()
+				}
+				h.prInfoMu.Unlock()
+				if needsPR {
+					sid := inst.ID
+					branch := inst.WorktreeBranch
+					repoDir := inst.WorktreeRepoRoot
+					if repoDir == "" {
+						repoDir = inst.WorktreePath
+					}
+					cmds = append(cmds, func() tea.Msg {
+						info, err := ghub.FetchPRForBranch(context.Background(), branch, repoDir)
+						return prInfoCheckMsg{sessionID: sid, prInfo: info, err: err}
+					})
+				}
+			}
+
 			if len(cmds) > 0 {
 				return h, tea.Batch(cmds...)
 			}
@@ -3092,6 +3143,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case prInfoCheckMsg:
+		if msg.err == nil {
+			h.prInfoMu.Lock()
+			h.prInfoCache[msg.sessionID] = msg.prInfo
+			h.prInfoCacheTs[msg.sessionID] = time.Now()
+			h.prInfoMu.Unlock()
+		}
+		return h, nil
+
 	case worktreeFinishResultMsg:
 		if msg.err != nil {
 			// Show error in dialog (user can go back or cancel)
@@ -3129,6 +3189,10 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(h.worktreeDirtyCache, msg.sessionID)
 		delete(h.worktreeDirtyCacheTs, msg.sessionID)
 		h.worktreeDirtyMu.Unlock()
+		h.prInfoMu.Lock()
+		delete(h.prInfoCache, msg.sessionID)
+		delete(h.prInfoCacheTs, msg.sessionID)
+		h.prInfoMu.Unlock()
 		h.logActivityMu.Lock()
 		delete(h.lastLogActivity, msg.sessionID)
 		h.logActivityMu.Unlock()
@@ -3235,6 +3299,45 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								_ = pm.Connect(name)
 							}(ts.Name)
 						}
+					}
+				}
+				h.instancesMu.RUnlock()
+			}
+
+			// Background PR info fetch for all worktree sessions (capped at 3 concurrent)
+			h.ghCheckedOnce.Do(func() { h.ghInstalled = ghub.GHInstalled() })
+			if h.ghInstalled {
+				fetched := 0
+				h.instancesMu.RLock()
+				for _, inst := range h.instances {
+					if fetched >= 3 {
+						break
+					}
+					if !inst.IsWorktree() || inst.WorktreeBranch == "" {
+						continue
+					}
+					h.prInfoMu.Lock()
+					prTs, hasPR := h.prInfoCacheTs[inst.ID]
+					needsPR := !hasPR || time.Since(prTs) > 45*time.Second
+					if needsPR {
+						h.prInfoCacheTs[inst.ID] = time.Now()
+					}
+					h.prInfoMu.Unlock()
+					if needsPR {
+						fetched++
+						sid := inst.ID
+						branch := inst.WorktreeBranch
+						repoDir := inst.WorktreeRepoRoot
+						if repoDir == "" {
+							repoDir = inst.WorktreePath
+						}
+						go func() {
+							info, _ := ghub.FetchPRForBranch(context.Background(), branch, repoDir)
+							h.prInfoMu.Lock()
+							h.prInfoCache[sid] = info
+							h.prInfoCacheTs[sid] = time.Now()
+							h.prInfoMu.Unlock()
+						}()
 					}
 				}
 				h.instancesMu.RUnlock()
@@ -7388,6 +7491,45 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 		worktreeBadge = wtStyle.Render(" [" + branch + "]")
 	}
 
+	// GitHub PR badge for worktree sessions with open PRs.
+	prBadge := ""
+	if inst.IsWorktree() && inst.WorktreeBranch != "" {
+		h.prInfoMu.Lock()
+		prInfo := h.prInfoCache[inst.ID]
+		h.prInfoMu.Unlock()
+		if prInfo != nil {
+			var icon string
+			var prStyle lipgloss.Style
+			switch prInfo.Status {
+			case ghub.CheckSuccess:
+				icon = "✓"
+				prStyle = lipgloss.NewStyle().Foreground(ColorGreen)
+			case ghub.CheckFailure:
+				icon = "✕"
+				prStyle = lipgloss.NewStyle().Foreground(ColorRed)
+			case ghub.CheckPending:
+				icon = "○"
+				prStyle = lipgloss.NewStyle().Foreground(ColorYellow)
+			case ghub.CheckMerged:
+				icon = "⊗"
+				prStyle = lipgloss.NewStyle().Foreground(ColorPurple)
+			default:
+				icon = "○"
+				prStyle = lipgloss.NewStyle().Foreground(ColorTextDim)
+			}
+			if selected {
+				prStyle = SessionStatusSelStyle
+			}
+			prText := fmt.Sprintf("#%d %s", prInfo.Number, icon)
+			rendered := prStyle.Render(" " + prText)
+			// Wrap with OSC 8 hyperlink if terminal supports it
+			if prInfo.URL != "" && tmux.SupportsHyperlinks() {
+				rendered = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", prInfo.URL, rendered)
+			}
+			prBadge = rendered
+		}
+	}
+
 	// Sandbox badge for containerized sessions.
 	sandboxBadge := ""
 	if inst.IsSandboxed() {
@@ -7398,11 +7540,11 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 		sandboxBadge = sbStyle.Render(" [sandbox]")
 	}
 
-	// Build row: [baseIndent][selection][tree][status] [title] [tool] [yolo] [worktree] [sandbox]
+	// Build row: [baseIndent][selection][tree][status] [title] [tool] [yolo] [worktree] [pr] [sandbox]
 	// Format: " ├─ ● session-name tool" or "▶└─ ● session-name tool"
 	// Sub-sessions get extra indent: "   ├─◐ sub-session tool"
 	row := fmt.Sprintf(
-		"%s%s%s %s %s%s%s%s%s",
+		"%s%s%s %s %s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
@@ -7411,6 +7553,7 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 		tool,
 		yoloBadge,
 		worktreeBadge,
+		prBadge,
 		sandboxBadge,
 	)
 	b.WriteString(row)
