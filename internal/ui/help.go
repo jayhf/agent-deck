@@ -196,6 +196,14 @@ func (h *HelpOverlay) View() string {
 			},
 		},
 		{
+			title: "PERMISSIONS (Claude waiting)",
+			items: [][2]string{
+				{"y", "Allow once"},
+				{"a", "Always allow"},
+				{"n", "Reject"},
+			},
+		},
+		{
 			title: "WORKTREES",
 			items: [][2]string{
 				{worktreeKey, "Finish worktree (merge + cleanup)"},
