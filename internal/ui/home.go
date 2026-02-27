@@ -5167,7 +5167,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Reject Claude permission prompt
 		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "claude" && inst.IsWaitingForPermission() {
 			if ts := inst.GetTmuxSession(); ts != nil {
-				_ = ts.SendKeys("n")
+				_ = ts.SendKeyRaw("Escape")
+				inst.MarkPermissionAnswered()
 			}
 			return h, nil
 		}
@@ -5340,7 +5341,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Approve Claude permission prompt
 		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "claude" && inst.IsWaitingForPermission() {
 			if ts := inst.GetTmuxSession(); ts != nil {
-				_ = ts.SendKeys("y")
+				_ = ts.SendKeyRaw("Enter")
+				inst.MarkPermissionAnswered()
 			}
 			return h, nil
 		}
@@ -5394,15 +5396,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						return h, h.restartSession(inst)
 					}
 				}
-			}
-		}
-		return h, nil
-
-	case "a":
-		// Always-allow Claude permission prompt
-		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "claude" && inst.IsWaitingForPermission() {
-			if ts := inst.GetTmuxSession(); ts != nil {
-				_ = ts.SendKeys("a")
 			}
 		}
 		return h, nil
@@ -8516,7 +8509,7 @@ func (h *Home) renderHelpBarMinimal() string {
 			contextKeys = renderKeys("⏎", newKey, quickKey, groupKey)
 		} else if item.Session != nil && item.Session.Tool == "claude" && item.Session.IsWaitingForPermission() {
 			// Permission prompt shortcuts
-			contextKeys = renderKeys("y", "a", "n", "⏎")
+			contextKeys = renderKeys("y", "n", "⏎")
 		} else {
 			contextKeys = renderKeys("⏎", newKey, quickKey, restartKey)
 			if item.Session != nil && item.Session.CanFork() {
@@ -8612,7 +8605,6 @@ func (h *Home) renderHelpBarCompact() string {
 			// Permission prompt shortcuts
 			contextHints = []string{
 				h.helpKeyShort("y", "Allow"),
-				h.helpKeyShort("a", "Always"),
 				h.helpKeyShort("n", "Reject"),
 				h.helpKeyShort("⏎", "Attach"),
 			}
@@ -8789,7 +8781,6 @@ func (h *Home) renderHelpBarFull() string {
 			contextTitle = "Permission"
 			primaryHints = []string{
 				h.helpKey("y", "Allow"),
-				h.helpKey("a", "Always"),
 				h.helpKey("n", "Reject"),
 				h.helpKey("Enter", "Attach"),
 			}

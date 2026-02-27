@@ -198,8 +198,7 @@ func (h *HelpOverlay) View() string {
 		{
 			title: "PERMISSIONS (Claude waiting)",
 			items: [][2]string{
-				{"y", "Allow once"},
-				{"a", "Always allow"},
+				{"y", "Allow"},
 				{"n", "Reject"},
 			},
 		},
