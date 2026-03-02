@@ -2839,15 +2839,6 @@ func (s *Session) SendKeys(keys string) error {
 	return cmd.Run()
 }
 
-// SendKeyRaw sends a single key to the tmux session without the -l flag.
-// Unlike SendKeys, this does NOT wrap in bracketed paste sequences (tmux 3.2+),
-// which is required for TUI apps that read single keypresses (e.g. permission prompts).
-func (s *Session) SendKeyRaw(key string) error {
-	s.invalidateCache()
-	cmd := exec.Command("tmux", "send-keys", "-t", s.Name, key)
-	return cmd.Run()
-}
-
 // SendEnter sends an Enter key to the tmux session
 func (s *Session) SendEnter() error {
 	s.invalidateCache()

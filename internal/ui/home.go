@@ -4242,14 +4242,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
-		// Reject Claude permission prompt
-		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "claude" && inst.IsWaitingForPermission() {
-			if ts := inst.GetTmuxSession(); ts != nil {
-				_ = ts.SendKeyRaw("Escape")
-				inst.MarkPermissionAnswered()
-			}
-			return h, nil
-		}
 		// Collect unique project paths sorted by most recently accessed
 		type pathInfo struct {
 			path           string
@@ -4380,14 +4372,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "y":
-		// Approve Claude permission prompt
-		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "claude" && inst.IsWaitingForPermission() {
-			if ts := inst.GetTmuxSession(); ts != nil {
-				_ = ts.SendKeyRaw("Enter")
-				inst.MarkPermissionAnswered()
-			}
-			return h, nil
-		}
 		// Toggle Gemini YOLO mode (requires restart)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -6905,9 +6889,6 @@ func (h *Home) renderHelpBarMinimal() string {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
 			contextKeys = keyStyle.Render("⏎") + " " + keyStyle.Render("n") + " " + keyStyle.Render("N") + " " + keyStyle.Render("g")
-		} else if item.Session != nil && item.Session.Tool == "claude" && item.Session.IsWaitingForPermission() {
-			// Permission prompt shortcuts
-			contextKeys = keyStyle.Render("y") + " " + keyStyle.Render("n") + " " + keyStyle.Render("⏎")
 		} else {
 			contextKeys = keyStyle.Render("⏎") + " " + keyStyle.Render("n") + " " + keyStyle.Render("N") + " " + keyStyle.Render("R")
 			if item.Session != nil && item.Session.CanFork() {
@@ -6964,13 +6945,6 @@ func (h *Home) renderHelpBarCompact() string {
 			contextHints = []string{
 				h.helpKeyShort("⏎", "Toggle"),
 				h.helpKeyShort("n/N", "New"),
-			}
-		} else if item.Session != nil && item.Session.Tool == "claude" && item.Session.IsWaitingForPermission() {
-			// Permission prompt shortcuts
-			contextHints = []string{
-				h.helpKeyShort("y", "Allow"),
-				h.helpKeyShort("n", "Reject"),
-				h.helpKeyShort("⏎", "Attach"),
 			}
 		} else {
 			contextHints = []string{
@@ -7073,13 +7047,6 @@ func (h *Home) renderHelpBarFull() string {
 			secondaryHints = []string{
 				h.helpKey("r", "Rename"),
 				h.helpKey("d", "Delete"),
-			}
-		} else if item.Session != nil && item.Session.Tool == "claude" && item.Session.IsWaitingForPermission() {
-			contextTitle = "Permission"
-			primaryHints = []string{
-				h.helpKey("y", "Allow"),
-				h.helpKey("n", "Reject"),
-				h.helpKey("Enter", "Attach"),
 			}
 		} else {
 			contextTitle = "Session"

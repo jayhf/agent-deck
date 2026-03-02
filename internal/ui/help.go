@@ -130,13 +130,6 @@ func (h *HelpOverlay) View() string {
 			},
 		},
 		{
-			title: "PERMISSIONS (Claude waiting)",
-			items: [][2]string{
-				{"y", "Allow"},
-				{"n", "Reject"},
-			},
-		},
-		{
 			title: "WORKTREES",
 			items: [][2]string{
 				{"W", "Finish worktree (merge + cleanup)"},
