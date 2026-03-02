@@ -3,7 +3,10 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -20,9 +23,12 @@ const (
 
 // PRInfo holds essential info about a GitHub pull request.
 type PRInfo struct {
-	Number int
-	URL    string
-	Status CheckStatus
+	Number            int
+	URL               string
+	Status            CheckStatus
+	IsDraft           bool // true when PR is a draft
+	Conflicting       bool // true when PR has merge conflicts with base branch
+	UnresolvedThreads int  // count of unresolved review threads (-1 = unknown)
 }
 
 // GHInstalled returns true if the gh CLI is on PATH.
@@ -33,10 +39,12 @@ func GHInstalled() bool {
 
 // ghPRView is the subset of `gh pr view --json` output we care about.
 type ghPRView struct {
-	Number             int       `json:"number"`
-	URL                string    `json:"url"`
-	State              string    `json:"state"`
-	StatusCheckRollup  []ghCheck `json:"statusCheckRollup"`
+	Number            int       `json:"number"`
+	URL               string    `json:"url"`
+	State             string    `json:"state"`
+	IsDraft           bool      `json:"isDraft"`
+	Mergeable         string    `json:"mergeable"` // MERGEABLE, CONFLICTING, UNKNOWN
+	StatusCheckRollup []ghCheck `json:"statusCheckRollup"`
 }
 
 type ghCheck struct {
@@ -53,7 +61,7 @@ func FetchPRForBranch(ctx context.Context, branch, repoRoot string) (*PRInfo, er
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "gh", "pr", "view", branch,
-		"--json", "number,url,state,statusCheckRollup")
+		"--json", "number,url,state,isDraft,mergeable,statusCheckRollup")
 	cmd.Dir = repoRoot
 
 	out, err := cmd.Output()
@@ -71,8 +79,10 @@ func FetchPRForBranch(ctx context.Context, branch, repoRoot string) (*PRInfo, er
 	}
 
 	info := &PRInfo{
-		Number: view.Number,
-		URL:    view.URL,
+		Number:      view.Number,
+		URL:         view.URL,
+		IsDraft:     view.IsDraft,
+		Conflicting: view.Mergeable == "CONFLICTING",
 	}
 
 	if view.State == "MERGED" {
@@ -115,4 +125,66 @@ func rollupStatus(checks []ghCheck) CheckStatus {
 		return CheckPending
 	}
 	return CheckSuccess
+}
+
+// parseOwnerRepo extracts the owner and repo from a GitHub PR URL
+// like "https://github.com/owner/repo/pull/123".
+func parseOwnerRepo(prURL string) (owner, repo string, ok bool) {
+	u, err := url.Parse(prURL)
+	if err != nil || u.Host != "github.com" {
+		return "", "", false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// graphqlResponse is used to unmarshal the reviewThreads query.
+type graphqlResponse struct {
+	Data struct {
+		Repository struct {
+			PullRequest struct {
+				ReviewThreads struct {
+					Nodes []struct {
+						IsResolved bool `json:"isResolved"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	} `json:"data"`
+}
+
+// FetchUnresolvedThreads returns the number of unresolved review threads for a PR.
+// Returns -1 on error (caller can treat as "unknown").
+func FetchUnresolvedThreads(ctx context.Context, prURL string, prNumber int) int {
+	owner, repo, ok := parseOwnerRepo(prURL)
+	if !ok {
+		return -1
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	query := fmt.Sprintf(`query { repository(owner: %q, name: %q) { pullRequest(number: %d) { reviewThreads(first: 100) { nodes { isResolved } } } } }`, owner, repo, prNumber)
+
+	cmd := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query)
+	out, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	var resp graphqlResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return -1
+	}
+
+	count := 0
+	for _, t := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
+		if !t.IsResolved {
+			count++
+		}
+	}
+	return count
 }
