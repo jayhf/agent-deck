@@ -256,12 +256,14 @@ type Home struct {
 	worktreeDirtyCacheTs map[string]time.Time // sessionID -> cache timestamp
 	worktreeDirtyMu      sync.Mutex           // Protects dirty cache maps
 
-	// GitHub PR info cache (lazy, 45s TTL)
-	prInfoCache   map[string]*ghub.PRInfo // sessionID -> PR info (nil = no PR)
-	prInfoCacheTs map[string]time.Time    // sessionID -> fetch timestamp
-	prInfoMu      sync.Mutex             // Protects PR info cache maps
-	ghInstalled   bool
-	ghCheckedOnce sync.Once
+	// GitHub PR info cache
+	prInfoCache      map[string]*ghub.PRInfo // sessionID -> PR info (nil = no PR)
+	prInfoCacheTs    map[string]time.Time    // sessionID -> fetch timestamp
+	prInfoMu         sync.Mutex             // Protects PR info cache maps
+	ghInstalled      bool
+	ghCheckedOnce    sync.Once
+	lastPRBulkFetch  time.Time // last time we did a bulk PR refresh
+	prHasPending     bool      // true if any PR had pending checks on last fetch
 
 	// Memory management: periodic cache pruning
 	lastCachePrune time.Time
@@ -591,6 +593,36 @@ type prInfoCheckMsg struct {
 	sessionID string
 	prInfo    *ghub.PRInfo
 	err       error
+}
+
+// prThreadsCheckMsg is sent when an async unresolved-threads fetch completes
+type prThreadsCheckMsg struct {
+	sessionID         string
+	unresolvedThreads int
+}
+
+// resolveSessionBranchAndRepo returns the branch name and repo directory for
+// a session's PR lookup. For worktree sessions the values come from instance
+// fields; for regular sessions the current branch is read from the project
+// path's git repo.  Returns ("","") when the session has no usable git context.
+func resolveSessionBranchAndRepo(inst *session.Instance) (branch, repoDir string) {
+	if inst.IsWorktree() && inst.WorktreeBranch != "" {
+		branch = inst.WorktreeBranch
+		repoDir = inst.WorktreeRepoRoot
+		if repoDir == "" {
+			repoDir = inst.WorktreePath
+		}
+		return
+	}
+	// Non-worktree: try the project path
+	if inst.ProjectPath == "" || !git.IsGitRepo(inst.ProjectPath) {
+		return "", ""
+	}
+	b, err := git.GetCurrentBranch(inst.ProjectPath)
+	if err != nil || b == "" || b == "HEAD" {
+		return "", ""
+	}
+	return b, inst.ProjectPath
 }
 
 // worktreeFinishResultMsg is sent when the worktree finish operation completes
@@ -1703,6 +1735,61 @@ func (h *Home) pruneAnalyticsCache() {
 		}
 	}
 	h.prInfoMu.Unlock()
+}
+
+// startBulkPRRefresh launches a goroutine that fetches PR info for all sessions
+// in parallel and updates the cache when done.
+func (h *Home) startBulkPRRefresh() {
+	type fetchTarget struct {
+		sid     string
+		branch  string
+		repoDir string
+	}
+	h.instancesMu.RLock()
+	var targets []fetchTarget
+	for _, inst := range h.instances {
+		branch, repoDir := resolveSessionBranchAndRepo(inst)
+		if branch != "" && repoDir != "" {
+			targets = append(targets, fetchTarget{sid: inst.ID, branch: branch, repoDir: repoDir})
+		}
+	}
+	h.instancesMu.RUnlock()
+	if len(targets) == 0 {
+		return
+	}
+	go func() {
+		type result struct {
+			sid  string
+			info *ghub.PRInfo
+		}
+		ch := make(chan result, len(targets))
+		for _, t := range targets {
+			go func(t fetchTarget) {
+				info, _ := ghub.FetchPRForBranch(context.Background(), t.branch, t.repoDir)
+				if info != nil && info.URL != "" {
+					info.UnresolvedThreads = ghub.FetchUnresolvedThreads(context.Background(), info.URL, info.Number)
+				}
+				ch <- result{sid: t.sid, info: info}
+			}(t)
+		}
+		results := make(map[string]*ghub.PRInfo, len(targets))
+		hasPending := false
+		for range targets {
+			r := <-ch
+			results[r.sid] = r.info
+			if r.info != nil && r.info.Status == ghub.CheckPending {
+				hasPending = true
+			}
+		}
+		h.prInfoMu.Lock()
+		now := time.Now()
+		for sid, info := range results {
+			h.prInfoCache[sid] = info
+			h.prInfoCacheTs[sid] = now
+		}
+		h.prHasPending = hasPending
+		h.prInfoMu.Unlock()
+	}()
 }
 
 // setError sets an error with timestamp for auto-dismiss
@@ -3532,6 +3619,13 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// so this just refreshes the display with current busy indicator state.
 		h.triggerStatusUpdate()
 
+		// Refresh PR info on return to list view (at most once per minute)
+		h.ghCheckedOnce.Do(func() { h.ghInstalled = ghub.GHInstalled() })
+		if h.ghInstalled && time.Since(h.lastPRBulkFetch) >= 1*time.Minute {
+			h.lastPRBulkFetch = time.Now()
+			h.startBulkPRRefresh()
+		}
+
 		// Cursor sync: if user switched sessions via notification bar during attach,
 		// move cursor to the session they were last viewing
 		h.lastNotifSwitchMu.Lock()
@@ -3693,30 +3787,6 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-			// GitHub PR info check (lazy, 45s TTL)
-			h.ghCheckedOnce.Do(func() { h.ghInstalled = ghub.GHInstalled() })
-			if h.ghInstalled && inst.IsWorktree() && inst.WorktreeBranch != "" {
-				h.prInfoMu.Lock()
-				prTs, hasPR := h.prInfoCacheTs[inst.ID]
-				needsPR := !hasPR || time.Since(prTs) > 45*time.Second
-				if needsPR {
-					h.prInfoCacheTs[inst.ID] = time.Now()
-				}
-				h.prInfoMu.Unlock()
-				if needsPR {
-					sid := inst.ID
-					branch := inst.WorktreeBranch
-					repoDir := inst.WorktreeRepoRoot
-					if repoDir == "" {
-						repoDir = inst.WorktreePath
-					}
-					cmds = append(cmds, func() tea.Msg {
-						info, err := ghub.FetchPRForBranch(context.Background(), branch, repoDir)
-						return prInfoCheckMsg{sessionID: sid, prInfo: info, err: err}
-					})
-				}
-			}
-
 			if len(cmds) > 0 {
 				return h, tea.Batch(cmds...)
 			}
@@ -3793,7 +3863,24 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.prInfoCache[msg.sessionID] = msg.prInfo
 			h.prInfoCacheTs[msg.sessionID] = time.Now()
 			h.prInfoMu.Unlock()
+			if msg.prInfo != nil && msg.prInfo.URL != "" {
+				sid := msg.sessionID
+				prURL := msg.prInfo.URL
+				prNum := msg.prInfo.Number
+				return h, func() tea.Msg {
+					count := ghub.FetchUnresolvedThreads(context.Background(), prURL, prNum)
+					return prThreadsCheckMsg{sessionID: sid, unresolvedThreads: count}
+				}
+			}
 		}
+		return h, nil
+
+	case prThreadsCheckMsg:
+		h.prInfoMu.Lock()
+		if info := h.prInfoCache[msg.sessionID]; info != nil {
+			info.UnresolvedThreads = msg.unresolvedThreads
+		}
+		h.prInfoMu.Unlock()
 		return h, nil
 
 	case worktreeFinishResultMsg:
@@ -3964,43 +4051,17 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.instancesMu.RUnlock()
 			}
 
-			// Background PR info fetch for all worktree sessions (capped at 3 concurrent)
+			// Bulk PR info refresh: 1 min if any check pending, 5 min otherwise
 			h.ghCheckedOnce.Do(func() { h.ghInstalled = ghub.GHInstalled() })
 			if h.ghInstalled {
-				fetched := 0
-				h.instancesMu.RLock()
-				for _, inst := range h.instances {
-					if fetched >= 3 {
-						break
-					}
-					if !inst.IsWorktree() || inst.WorktreeBranch == "" {
-						continue
-					}
-					h.prInfoMu.Lock()
-					prTs, hasPR := h.prInfoCacheTs[inst.ID]
-					needsPR := !hasPR || time.Since(prTs) > 45*time.Second
-					if needsPR {
-						h.prInfoCacheTs[inst.ID] = time.Now()
-					}
-					h.prInfoMu.Unlock()
-					if needsPR {
-						fetched++
-						sid := inst.ID
-						branch := inst.WorktreeBranch
-						repoDir := inst.WorktreeRepoRoot
-						if repoDir == "" {
-							repoDir = inst.WorktreePath
-						}
-						go func() {
-							info, _ := ghub.FetchPRForBranch(context.Background(), branch, repoDir)
-							h.prInfoMu.Lock()
-							h.prInfoCache[sid] = info
-							h.prInfoCacheTs[sid] = time.Now()
-							h.prInfoMu.Unlock()
-						}()
-					}
+				ttl := 5 * time.Minute
+				if h.prHasPending {
+					ttl = 1 * time.Minute
 				}
-				h.instancesMu.RUnlock()
+				if time.Since(h.lastPRBulkFetch) >= ttl {
+					h.lastPRBulkFetch = time.Now()
+					h.startBulkPRRefresh()
+				}
 			}
 		}
 
@@ -9455,9 +9516,9 @@ func (h *Home) renderSessionItem(
 		worktreeBadge = wtStyle.Render(" [" + branch + "]")
 	}
 
-	// GitHub PR badge for worktree sessions with open PRs.
+	// GitHub PR badge for sessions with open PRs.
 	prBadge := ""
-	if inst.IsWorktree() && inst.WorktreeBranch != "" {
+	{
 		h.prInfoMu.Lock()
 		prInfo := h.prInfoCache[inst.ID]
 		h.prInfoMu.Unlock()
@@ -9484,8 +9545,21 @@ func (h *Home) renderSessionItem(
 			if selected {
 				prStyle = SessionStatusSelStyle
 			}
-			prText := fmt.Sprintf("#%d %s", prInfo.Number, icon)
-			rendered := prStyle.Render(" " + prText)
+			rendered := prStyle.Render(fmt.Sprintf(" #%d %s", prInfo.Number, icon))
+			if prInfo.Conflicting {
+				warnStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+				if selected {
+					warnStyle = SessionStatusSelStyle
+				}
+				rendered += warnStyle.Render(" ⚠")
+			}
+			if prInfo.UnresolvedThreads > 0 {
+				commentStyle := lipgloss.NewStyle().Foreground(ColorText)
+				if selected {
+					commentStyle = SessionStatusSelStyle
+				}
+				rendered += commentStyle.Render(fmt.Sprintf(" %d✎", prInfo.UnresolvedThreads))
+			}
 			// Wrap with OSC 8 hyperlink if terminal supports it
 			if prInfo.URL != "" && tmux.SupportsHyperlinks() {
 				rendered = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", prInfo.URL, rendered)
