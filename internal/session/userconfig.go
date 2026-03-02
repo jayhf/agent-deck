@@ -1173,6 +1173,8 @@ func GetWorktreeSettings() WorktreeSettings {
 	}
 	if settings.BranchPrefix == "" {
 		settings.BranchPrefix = "feature/"
+	} else if settings.BranchPrefix == "none" {
+		settings.BranchPrefix = ""
 	}
 
 	return settings
