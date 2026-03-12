@@ -193,6 +193,7 @@ func (h *HelpOverlay) View() string {
 				{sendKey, "Send output to session"},
 				{execShellKey, "Exec shell in sandbox container"},
 				{notesKey, "Edit notes"},
+				{h.key(hotkeyOpenEditor, "o"), "Open in VS Code"},
 			},
 		},
 		{
