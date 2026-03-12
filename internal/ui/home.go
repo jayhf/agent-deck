@@ -5060,6 +5060,19 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "o":
+		// Open VS Code at the session's project/worktree directory
+		if inst := h.getSelectedSession(); inst != nil {
+			dir := inst.ProjectPath
+			if inst.IsWorktree() && inst.WorktreePath != "" {
+				dir = inst.WorktreePath
+			}
+			if dir != "" {
+				_ = exec.Command("code", dir).Start()
+			}
+		}
+		return h, nil
+
 	case "ctrl+g":
 		// Open Gemini model selection dialog (only for Gemini sessions)
 		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "gemini" {

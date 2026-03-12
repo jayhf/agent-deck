@@ -27,6 +27,7 @@ const (
 	hotkeySendOutput      = "send_output"
 	hotkeyExecShell       = "exec_shell"
 	hotkeyEditNotes       = "edit_notes"
+	hotkeyOpenEditor      = "open_editor"
 	hotkeyWorktreeFinish  = "worktree_finish"
 	hotkeyCreateGroup     = "create_group"
 	hotkeySearch          = "search"
@@ -57,6 +58,7 @@ var hotkeyActionOrder = []string{
 	hotkeySendOutput,
 	hotkeyExecShell,
 	hotkeyEditNotes,
+	hotkeyOpenEditor,
 	hotkeyWorktreeFinish,
 	hotkeyCreateGroup,
 	hotkeySearch,
@@ -87,6 +89,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySendOutput:      "x",
 	hotkeyExecShell:       "E",
 	hotkeyEditNotes:       "e",
+	hotkeyOpenEditor:      "o",
 	hotkeyWorktreeFinish:  "W",
 	hotkeyCreateGroup:     "g",
 	hotkeySearch:          "/",
