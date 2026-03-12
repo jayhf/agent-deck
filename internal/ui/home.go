@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -7193,6 +7194,19 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				h.beginNotesEditing(item.Session)
+			}
+		}
+		return h, nil
+
+	case "o":
+		// Open VS Code at the session's project/worktree directory
+		if inst := h.getSelectedSession(); inst != nil {
+			dir := inst.ProjectPath
+			if inst.IsWorktree() && inst.WorktreePath != "" {
+				dir = inst.WorktreePath
+			}
+			if dir != "" {
+				_ = exec.Command("code", dir).Start()
 			}
 		}
 		return h, nil
