@@ -53,8 +53,8 @@ func TestDialogSetSize(t *testing.T) {
 func TestDialogPresetCommands(t *testing.T) {
 	d := NewNewDialog()
 
-	// Should have shell (empty), claude, gemini, opencode, codex
-	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex"}
+	// Should have shell (empty), claude, gemini, opencode, codex, pi
+	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi"}
 
 	if len(d.presetCommands) != len(expectedCommands) {
 		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
@@ -923,8 +923,9 @@ func TestNewDialog_ToggleWorktree_AutoPopulatesBranch(t *testing.T) {
 	if !d.worktreeEnabled {
 		t.Fatal("worktreeEnabled should be true after toggle")
 	}
-	if d.branchInput.Value() != "feature/amber-falcon" {
-		t.Errorf("branch = %q, want %q", d.branchInput.Value(), "feature/amber-falcon")
+	expected := session.GetWorktreeSettings().BranchPrefix + "amber-falcon"
+	if d.branchInput.Value() != expected {
+		t.Errorf("branch = %q, want %q", d.branchInput.Value(), expected)
 	}
 	if !d.branchAutoSet {
 		t.Error("branchAutoSet should be true after auto-population")
@@ -1190,5 +1191,56 @@ func TestNewDialog_FilterPaths_EmptyInput(t *testing.T) {
 
 	if len(d.pathSuggestions) != 3 {
 		t.Errorf("expected all 3 suggestions for empty input, got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_BranchPrefix_Default(t *testing.T) {
+	d := NewNewDialog()
+	expected := session.GetWorktreeSettings().BranchPrefix
+	if d.branchPrefix != expected {
+		t.Errorf("expected branchPrefix %q from constructor, got %q", expected, d.branchPrefix)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Custom_AutoPopulates(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "dev/"
+	d.nameInput.SetValue("my-session")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "dev/my-session" {
+		t.Errorf("expected branch %q, got %q", "dev/my-session", got)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Empty_NoPrefix(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = ""
+	d.nameInput.SetValue("my-session")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "my-session" {
+		t.Errorf("expected branch %q, got %q", "my-session", got)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Placeholder_Updated(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "fix/"
+	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
+
+	if d.branchInput.Placeholder != "fix/branch-name" {
+		t.Errorf("expected placeholder %q, got %q", "fix/branch-name", d.branchInput.Placeholder)
+	}
+}
+
+func TestNewDialog_ToggleWorktree_CustomPrefix(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "dev/"
+	d.nameInput.SetValue("cool-feature")
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "dev/cool-feature" {
+		t.Errorf("expected branch %q, got %q", "dev/cool-feature", got)
 	}
 }

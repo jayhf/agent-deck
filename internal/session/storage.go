@@ -75,12 +75,17 @@ type InstanceData struct {
 
 	// Latest user input for context
 	LatestPrompt string `json:"latest_prompt,omitempty"`
+	Notes        string `json:"notes,omitempty"`
 
 	// Tool-specific launch options (generic for all tools: claude, codex, etc.)
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
 	// MCP tracking (persisted for sync status display)
 	LoadedMCPNames []string `json:"loaded_mcp_names,omitempty"`
+
+	// Sandbox support
+	Sandbox          *SandboxConfig `json:"sandbox,omitempty"`
+	SandboxContainer string         `json:"sandbox_container,omitempty"`
 
 	// SSH remote support
 	SSHHost       string `json:"ssh_host,omitempty"`
@@ -257,6 +262,14 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 		if inst.tmuxSession != nil {
 			tmuxName = inst.tmuxSession.Name
 		}
+		var sandboxJSON json.RawMessage
+		if inst.Sandbox != nil {
+			data, err := json.Marshal(inst.Sandbox)
+			if err != nil {
+				return fmt.Errorf("failed to marshal sandbox for %s: %w", inst.ID, err)
+			}
+			sandboxJSON = data
+		}
 
 		toolData := statedb.MarshalToolData(
 			inst.ClaudeSessionID, inst.ClaudeDetectedAt,
@@ -264,8 +277,9 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 			inst.GeminiYoloMode, inst.GeminiModel,
 			inst.OpenCodeSessionID, inst.OpenCodeDetectedAt,
 			inst.CodexSessionID, inst.CodexDetectedAt,
-			inst.LatestPrompt, inst.LoadedMCPNames,
+			inst.LatestPrompt, inst.Notes, inst.LoadedMCPNames,
 			inst.ToolOptionsJSON,
+			sandboxJSON, inst.SandboxContainer,
 			inst.SSHHost, inst.SSHRemotePath,
 		)
 
@@ -405,9 +419,11 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			geminiYolo, geminiModel,
 			opencodeSID, opencodeAt,
 			codexSID, codexAt,
-			latestPrompt, loadedMCPs,
+			latestPrompt, notes, loadedMCPs,
 			toolOpts,
+			sandboxJSON, sandboxContainer,
 			sshHost2, sshRemotePath2 := statedb.UnmarshalToolData(r.ToolData)
+		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		instances[i] = &InstanceData{
 			ID:                 r.ID,
@@ -437,8 +453,11 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			CodexSessionID:     codexSID,
 			CodexDetectedAt:    codexAt,
 			LatestPrompt:       latestPrompt,
+			Notes:              notes,
 			ToolOptionsJSON:    toolOpts,
 			LoadedMCPNames:     loadedMCPs,
+			Sandbox:            sandboxCfg,
+			SandboxContainer:   sandboxContainer,
 			SSHHost:            sshHost2,
 			SSHRemotePath:      sshRemotePath2,
 		}
@@ -490,9 +509,11 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			geminiYolo, geminiModel,
 			opencodeSID, opencodeAt,
 			codexSID, codexAt,
-			latestPrompt, loadedMCPs,
+			latestPrompt, notes, loadedMCPs,
 			toolOpts,
+			sandboxJSON, sandboxContainer,
 			sshHost, sshRemotePath := statedb.UnmarshalToolData(r.ToolData)
+		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		data.Instances[i] = &InstanceData{
 			ID:                 r.ID,
@@ -522,8 +543,11 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			CodexSessionID:     codexSID,
 			CodexDetectedAt:    codexAt,
 			LatestPrompt:       latestPrompt,
+			Notes:              notes,
 			ToolOptionsJSON:    toolOpts,
 			LoadedMCPNames:     loadedMCPs,
+			Sandbox:            sandboxCfg,
+			SandboxContainer:   sandboxContainer,
 			SSHHost:            sshHost,
 			SSHRemotePath:      sshRemotePath,
 		}
@@ -718,7 +742,10 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			CodexDetectedAt:    instData.CodexDetectedAt,
 			ToolOptionsJSON:    instData.ToolOptionsJSON,
 			LatestPrompt:       instData.LatestPrompt,
+			Notes:              instData.Notes,
 			LoadedMCPNames:     instData.LoadedMCPNames,
+			Sandbox:            instData.Sandbox,
+			SandboxContainer:   instData.SandboxContainer,
 			SSHHost:            instData.SSHHost,
 			SSHRemotePath:      instData.SSHRemotePath,
 			tmuxSession:        tmuxSess,
@@ -749,7 +776,21 @@ func statusToString(s Status) string {
 		return "idle"
 	case StatusError:
 		return "waiting" // Treat errors as needing attention
+	case StatusStopped:
+		return "inactive" // Stopped sessions are intentionally inactive
 	default:
 		return "waiting"
 	}
+}
+
+func decodeSandboxConfig(data json.RawMessage) *SandboxConfig {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var cfg SandboxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	return &cfg
 }

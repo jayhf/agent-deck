@@ -13,6 +13,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/profile"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
@@ -120,6 +121,7 @@ func handleSessionStart(profile string, args []string) {
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	message := fs.String("message", "", "Initial message to send once agent is ready")
 	messageShort := fs.String("m", "", "Initial message to send once agent is ready (short)")
+	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode when starting Gemini or Codex sessions")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session start <id|title> [options]")
@@ -167,6 +169,11 @@ func handleSessionStart(profile string, args []string) {
 	// Check if already running
 	if inst.Exists() {
 		out.Error(fmt.Sprintf("session '%s' is already running", inst.Title), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	if err := applyCLIYoloOverride(inst, *yoloMode); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -329,9 +336,13 @@ func handleSessionRestart(profile string, args []string) {
 		out.Error(fmt.Sprintf("failed to restart session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	warning := inst.ConsumeCodexRestartWarning()
+	if warning != "" && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+	}
 
 	// If restart created a fresh session (no prior ID), capture the new ID
-	if inst.Tool == "claude" && inst.ClaudeSessionID == "" {
+	if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID == "" {
 		inst.PostStartSync(3 * time.Second)
 	}
 
@@ -342,11 +353,15 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	// Output success
-	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), map[string]interface{}{
+	data := map[string]interface{}{
 		"success": true,
 		"id":      inst.ID,
 		"title":   inst.Title,
-	})
+	}
+	if warning != "" {
+		data["warning"] = warning
+	}
+	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), data)
 }
 
 // handleSessionFork forks a Claude session
@@ -413,7 +428,7 @@ func handleSessionFork(profile string, args []string) {
 	}
 
 	// Verify it's a Claude session
-	if inst.Tool != "claude" {
+	if !session.IsClaudeCompatible(inst.Tool) {
 		out.Error(
 			fmt.Sprintf("session '%s' is not a Claude session (tool: %s)", inst.Title, inst.Tool),
 			ErrCodeInvalidOperation,
@@ -674,7 +689,7 @@ func handleSessionShow(profile string, args []string) {
 
 	// Get MCP info if Claude session
 	var mcpInfo *session.MCPInfo
-	if inst.Tool == "claude" {
+	if session.IsClaudeCompatible(inst.Tool) {
 		mcpInfo = inst.GetMCPInfo()
 	}
 
@@ -696,7 +711,7 @@ func handleSessionShow(profile string, args []string) {
 		jsonData["command"] = inst.Command
 	}
 
-	if inst.Tool == "claude" {
+	if session.IsClaudeCompatible(inst.Tool) {
 		jsonData["claude_session_id"] = inst.ClaudeSessionID
 		jsonData["can_fork"] = inst.CanFork()
 		jsonData["can_restart"] = inst.CanRestart()
@@ -732,7 +747,7 @@ func handleSessionShow(profile string, args []string) {
 		sb.WriteString(fmt.Sprintf("Command: %s\n", inst.Command))
 	}
 
-	if inst.Tool == "claude" {
+	if session.IsClaudeCompatible(inst.Tool) {
 		if inst.ClaudeSessionID != "" {
 			truncatedID := inst.ClaudeSessionID
 			if len(truncatedID) > 36 {
@@ -1111,6 +1126,7 @@ func handleSessionSetParent(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Link a session as a sub-session of another session.")
 		fmt.Println("The session will inherit the parent's group.")
+		fmt.Println("This works for any session, including those created with --no-parent.")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1396,7 +1412,7 @@ func handleSessionSend(profile string, args []string) {
 		// so the ClaudeSessionID may be stale (e.g., PostStartSync timed out,
 		// TUI updated it during the wait, or /clear created a new session).
 		// First try tmux env (fast), then fall back to reloading from DB.
-		if inst.Tool == "claude" {
+		if session.IsClaudeCompatible(inst.Tool) {
 			if freshID := inst.GetSessionIDFromTmux(); freshID != "" {
 				inst.ClaudeSessionID = freshID
 				inst.ClaudeDetectedAt = time.Now()
@@ -1448,178 +1464,6 @@ type sendRetryOptions struct {
 	checkDelay time.Duration
 }
 
-// hasUnsentPastedPrompt detects Claude's composer marker for a pasted-but-unsent prompt.
-// Example: "[Pasted text #1 +89 lines]".
-func hasUnsentPastedPrompt(content string) bool {
-	return strings.Contains(strings.ToLower(content), "[pasted text")
-}
-
-func normalizePromptText(s string) string {
-	s = strings.ReplaceAll(s, "\u00a0", " ")
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	return strings.Join(strings.Fields(s), " ")
-}
-
-func isComposerDividerLine(line string) bool {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return false
-	}
-	count := 0
-	for _, r := range line {
-		if r == '─' || r == '-' || r == '━' {
-			count++
-			continue
-		}
-		return false
-	}
-	return count >= 10
-}
-
-func parsePromptFromComposerBlock(lines []string) (string, bool) {
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimRight(lines[i], " \t\r")
-		trimmed := strings.TrimLeft(line, " \t")
-		if trimmed == "" {
-			continue
-		}
-
-		markerLen := 0
-		for _, marker := range []string{"❯", "›"} {
-			if strings.HasPrefix(trimmed, marker) {
-				markerLen = len(marker)
-				break
-			}
-		}
-		if markerLen == 0 {
-			continue
-		}
-
-		bodyParts := []string{strings.TrimSpace(trimmed[markerLen:])}
-		for j := i + 1; j < len(lines); j++ {
-			cont := strings.TrimRight(lines[j], " \t\r")
-			if strings.TrimSpace(cont) == "" {
-				if len(bodyParts) > 0 && bodyParts[len(bodyParts)-1] != "" {
-					break
-				}
-				continue
-			}
-			// Wrapped composer lines are typically indented continuation lines.
-			if strings.HasPrefix(cont, "  ") || strings.HasPrefix(cont, "\t") {
-				bodyParts = append(bodyParts, strings.TrimSpace(cont))
-				continue
-			}
-			break
-		}
-
-		return normalizePromptText(strings.Join(bodyParts, " ")), true
-	}
-	return "", false
-}
-
-func currentComposerPrompt(content string) (string, bool) {
-	lines := strings.Split(content, "\n")
-	if len(lines) > 240 {
-		lines = lines[len(lines)-240:]
-	}
-
-	// Primary path: parse the explicit composer region between the last two
-	// divider lines nearest the bottom of the pane.
-	lastDivider := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if isComposerDividerLine(lines[i]) {
-			lastDivider = i
-			break
-		}
-	}
-	if lastDivider > 0 {
-		prevDivider := -1
-		for i := lastDivider - 1; i >= 0; i-- {
-			if isComposerDividerLine(lines[i]) {
-				prevDivider = i
-				break
-			}
-		}
-		if prevDivider >= 0 && prevDivider+1 < lastDivider {
-			if body, ok := parsePromptFromComposerBlock(lines[prevDivider+1 : lastDivider]); ok {
-				return body, true
-			}
-		}
-	}
-
-	// Fallback for layouts without clear divider lines: look near the bottom
-	// for a strict prompt marker at the start of the line.
-	start := 0
-	if len(lines) > 40 {
-		start = len(lines) - 40
-	}
-	for i := len(lines) - 1; i >= start; i-- {
-		trimmed := strings.TrimLeft(lines[i], " \t")
-		if strings.TrimSpace(trimmed) == "" {
-			continue
-		}
-		for _, marker := range []string{"❯", "›"} {
-			if strings.HasPrefix(trimmed, marker) {
-				return normalizePromptText(strings.TrimSpace(trimmed[len(marker):])), true
-			}
-		}
-	}
-	return "", false
-}
-
-func hasCurrentComposerPrompt(content string) bool {
-	_, ok := currentComposerPrompt(content)
-	return ok
-}
-
-// hasUnsentComposerPrompt detects when the message text is still present in the
-// interactive input line (e.g., "❯ message"), which indicates Enter was not
-// accepted yet even if no "[Pasted text ...]" marker is shown.
-func hasUnsentComposerPrompt(content, message string) bool {
-	msg := normalizePromptText(message)
-	if msg == "" {
-		return false
-	}
-
-	promptBody, hasPrompt := currentComposerPrompt(content)
-	if !hasPrompt {
-		return false
-	}
-	promptBody = normalizePromptText(promptBody)
-	if promptBody == "" {
-		return false
-	}
-
-	// Direct match (short prompts or fully visible single-line prompts).
-	if strings.HasPrefix(promptBody, msg) || strings.Contains(promptBody, msg) {
-		return true
-	}
-
-	// Wrapped prompts: Claude often shows only the first visual line of the
-	// current composer input (message wraps to following indented lines).
-	// If the visible prompt line is a substantial prefix of the message,
-	// Enter was not accepted yet.
-	const minWrappedPrefixLen = 16
-	if len(promptBody) >= minWrappedPrefixLen && strings.HasPrefix(msg, promptBody) {
-		return true
-	}
-
-	// Fallback: compare a short message prefix to handle truncation/formatting
-	// differences while avoiding over-broad matching.
-	needle := msg
-	if len(needle) > 32 {
-		needle = needle[:32]
-	}
-	if strings.Contains(promptBody, needle) {
-		return true
-	}
-
-	return false
-}
-
 func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool, opts sendRetryOptions) error {
 	if opts.maxRetries <= 0 {
 		opts.maxRetries = 1
@@ -1654,7 +1498,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		unsentPromptDetected := false
 		if rawContent, captureErr := target.CapturePaneFresh(); captureErr == nil {
 			content := tmux.StripANSI(rawContent)
-			unsentPromptDetected = hasUnsentPastedPrompt(content) || hasUnsentComposerPrompt(content, message)
+			unsentPromptDetected = send.HasUnsentPastedPrompt(content) || send.HasUnsentComposerPrompt(content, message)
 		}
 		status, err := target.GetStatus()
 
@@ -1684,9 +1528,11 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				}
 			} else {
 				waitingNoMarkerChecks = 0
-				// We haven't observed any post-send activity yet. Periodically
-				// nudge Enter while waiting to handle late prompt-state races.
-				if retry%3 == 2 {
+				// We haven't observed any post-send activity yet. Nudge Enter
+				// aggressively in the early window (every iteration for first 5
+				// retries) then every 2nd iteration. This addresses bracketed
+				// paste timing failures that are most likely early on.
+				if retry < 5 || retry%2 == 0 {
 					_ = target.SendEnter()
 				}
 			}
@@ -1694,8 +1540,10 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		}
 		waitingNoMarkerChecks = 0
 
-		// Ambiguous state: keep a small best-effort Enter retry budget.
-		if retry < 2 {
+		// Ambiguous state: keep a best-effort Enter retry budget.
+		// Increased from 2 to 4 because some TUI frameworks take longer
+		// to process and reflect state.
+		if retry < 4 {
 			_ = target.SendEnter()
 		}
 	}
@@ -1738,10 +1586,22 @@ func waitForAgentReady(tmuxSess *tmux.Session, tool string) error {
 		alreadyReady := readyCount >= 10 && attempt >= 15 // At least 3s elapsed
 		if (sawActive && (status == "waiting" || status == "idle")) || alreadyReady {
 			if tool == "claude" {
-				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil && !hasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
+				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil && !send.HasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
 					// Claude can report waiting before the interactive prompt is visible.
 					// Keep polling until the prompt line is present.
 					continue
+				}
+			}
+			// Gate Codex sends on prompt readiness: wait for "codex>" or
+			// "Continue?" to be visible before considering the agent ready.
+			if tool == "codex" {
+				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil {
+					content := tmux.StripANSI(rawContent)
+					detector := tmux.NewPromptDetector("codex")
+					if !detector.HasPrompt(content) {
+						// Codex hasn't shown its prompt yet; keep polling.
+						continue
+					}
 				}
 			}
 			time.Sleep(300 * time.Millisecond) // Small delay for UI to render
@@ -1769,6 +1629,9 @@ func waitForCompletion(checker statusChecker, timeout time.Duration) (string, er
 	// sendWithRetry already checks for "active", but give a small buffer.
 	time.Sleep(1 * time.Second)
 
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 5
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1778,10 +1641,14 @@ func waitForCompletion(checker statusChecker, timeout time.Duration) (string, er
 
 		status, err := checker.GetStatus()
 		if err != nil {
-			// Transient tmux error, keep polling
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutiveErrors {
+				return "error", nil // Session likely died
+			}
 			time.Sleep(pollInterval)
 			continue
 		}
+		consecutiveErrors = 0
 
 		// "active" means still processing, keep waiting
 		if status == "active" {

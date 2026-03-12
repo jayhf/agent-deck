@@ -179,6 +179,7 @@ func handleConductorSetup(profile string, args []string) {
 	settings := config.Conductor
 	telegramConfigured := settings.Telegram.Token != ""
 	slackConfigured := settings.Slack.BotToken != ""
+	discordConfigured := settings.Discord.BotToken != ""
 
 	// Step 2: If conductor system not enabled, run first-time setup
 	if !settings.Enabled {
@@ -268,12 +269,68 @@ func handleConductorSetup(profile string, args []string) {
 			slackConfigured = true
 		}
 
+		// Ask about Discord
+		fmt.Print("Connect Discord bot for channel-based control? (y/N): ")
+		dcAnswer, _ := reader.ReadString('\n')
+		dcAnswer = strings.TrimSpace(strings.ToLower(dcAnswer))
+
+		var discord session.DiscordSettings
+		if dcAnswer == "y" || dcAnswer == "yes" {
+			fmt.Println()
+			fmt.Println("  1. Create an application at https://discord.com/developers/applications")
+			fmt.Println("  2. Bot tab -> create bot, copy the token")
+			fmt.Println("  3. Enable MESSAGE CONTENT intent in the Bot tab")
+			fmt.Println("  4. OAuth2 -> URL Generator: scopes=[bot, applications.commands],")
+			fmt.Println("     permissions=[Send Messages, Read Message History]")
+			fmt.Println("  5. Invite bot to your server using the generated URL")
+			fmt.Println()
+
+			fmt.Print("Discord bot token: ")
+			dcBotToken, _ := reader.ReadString('\n')
+			dcBotToken = strings.TrimSpace(dcBotToken)
+			if dcBotToken == "" {
+				fmt.Fprintln(os.Stderr, "Error: bot token is required")
+				os.Exit(1)
+			}
+
+			fmt.Print("Discord guild (server) ID: ")
+			dcGuildIDStr, _ := reader.ReadString('\n')
+			dcGuildIDStr = strings.TrimSpace(dcGuildIDStr)
+			dcGuildID, err := strconv.ParseInt(dcGuildIDStr, 10, 64)
+			if err != nil || dcGuildID == 0 {
+				fmt.Fprintln(os.Stderr, "Error: valid guild ID is required")
+				os.Exit(1)
+			}
+
+			fmt.Print("Discord channel ID: ")
+			dcChannelIDStr, _ := reader.ReadString('\n')
+			dcChannelIDStr = strings.TrimSpace(dcChannelIDStr)
+			dcChannelID, err := strconv.ParseInt(dcChannelIDStr, 10, 64)
+			if err != nil || dcChannelID == 0 {
+				fmt.Fprintln(os.Stderr, "Error: valid channel ID is required")
+				os.Exit(1)
+			}
+
+			fmt.Print("Your Discord user ID: ")
+			dcUserIDStr, _ := reader.ReadString('\n')
+			dcUserIDStr = strings.TrimSpace(dcUserIDStr)
+			dcUserID, err := strconv.ParseInt(dcUserIDStr, 10, 64)
+			if err != nil || dcUserID == 0 {
+				fmt.Fprintln(os.Stderr, "Error: valid user ID is required")
+				os.Exit(1)
+			}
+
+			discord = session.DiscordSettings{BotToken: dcBotToken, GuildID: dcGuildID, ChannelID: dcChannelID, UserID: dcUserID}
+			discordConfigured = true
+		}
+
 		// Update config (no longer stores profiles list, conductors are on disk)
 		settings = session.ConductorSettings{
 			Enabled:           true,
 			HeartbeatInterval: 15,
 			Telegram:          telegram,
 			Slack:             slack,
+			Discord:           discord,
 		}
 		config.Conductor = settings
 
@@ -379,21 +436,27 @@ func handleConductorSetup(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Step 6: Install heartbeat timer (if heartbeat enabled)
+	// Step 6: Install heartbeat timer (if heartbeat enabled and interval > 0)
 	if heartbeatEnabled {
 		interval := settings.GetHeartbeatInterval()
-		if err := session.InstallHeartbeatScript(name, resolvedProfile); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat script: %v\n", err)
-		} else if err := session.InstallHeartbeatDaemon(name, resolvedProfile, interval); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat daemon: %v\n", err)
-		} else if !*jsonOutput {
-			fmt.Printf("  [ok] Heartbeat timer installed (every %d min)\n", interval)
+		if interval <= 0 {
+			if !*jsonOutput {
+				fmt.Println("  [skip] Heartbeat disabled (interval = 0)")
+			}
+		} else {
+			if err := session.InstallHeartbeatScript(name, resolvedProfile); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat script: %v\n", err)
+			} else if err := session.InstallHeartbeatDaemon(name, resolvedProfile, interval); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat daemon: %v\n", err)
+			} else if !*jsonOutput {
+				fmt.Printf("  [ok] Heartbeat timer installed (every %d min)\n", interval)
+			}
 		}
 	}
 
-	// Step 7: Install bridge (if Telegram or Slack is configured)
+	// Step 7: Install bridge (if Telegram, Slack, or Discord is configured)
 	var plistPath string
-	if telegramConfigured || slackConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured {
 		if !*jsonOutput {
 			fmt.Println()
 			fmt.Println("Installing bridge...")
@@ -446,6 +509,7 @@ func handleConductorSetup(profile string, args []string) {
 			"heartbeat":               heartbeatEnabled,
 			"telegram":                telegramConfigured,
 			"slack":                   slackConfigured,
+			"discord":                 discordConfigured,
 			"notifier_daemon_running": session.IsTransitionNotifierDaemonRunning(),
 		}
 		if plistPath != "" {
@@ -472,7 +536,7 @@ func handleConductorSetup(profile string, args []string) {
 	fmt.Println("Next steps:")
 	fmt.Printf("  agent-deck -p %s session start %s\n", resolvedProfile, sessionTitle)
 	condDir, _ := session.ConductorDir()
-	if telegramConfigured || slackConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured {
 		fmt.Println()
 		if telegramConfigured {
 			fmt.Println("  Test from Telegram: send /status to your bot")
@@ -480,11 +544,15 @@ func handleConductorSetup(profile string, args []string) {
 		if slackConfigured {
 			fmt.Println("  Test from Slack: post a message in the configured channel")
 		}
+		if discordConfigured {
+			fmt.Println("  Test from Discord: post a message in the configured channel or use /ad-status")
+		}
 		fmt.Printf("  View bridge logs:   tail -f %s/bridge.log\n", condDir)
 	} else {
 		fmt.Println()
 		fmt.Println("  To add Telegram later: re-run setup after adding [conductor.telegram] to config.toml")
 		fmt.Println("  To add Slack later: re-run setup after adding [conductor.slack] to config.toml")
+		fmt.Println("  To add Discord later: re-run setup after adding [conductor.discord] to config.toml")
 	}
 }
 
@@ -717,6 +785,10 @@ func handleConductorStatus(_ string, args []string) {
 		os.Exit(1)
 	}
 
+	// Auto-migrate before status check so stale heartbeat scripts self-heal even
+	// when conductors are globally disabled in config.
+	runAutoMigration(*jsonOutput)
+
 	settings := session.GetConductorSettings()
 	if !settings.Enabled {
 		if *jsonOutput {
@@ -727,9 +799,6 @@ func handleConductorStatus(_ string, args []string) {
 		}
 		return
 	}
-
-	// Auto-migrate before status check
-	runAutoMigration(*jsonOutput)
 
 	// Get conductors to display
 	var conductors []session.ConductorMeta
@@ -978,11 +1047,14 @@ func installPythonDeps() {
 		if config.Conductor.Slack.BotToken != "" {
 			packages = append(packages, "slack-bolt", "slack-sdk", "aiohttp")
 		}
+		if config.Conductor.Discord.BotToken != "" {
+			packages = append(packages, "discord.py")
+		}
 	}
 
 	// Fallback: if no specific integration detected, install all
 	if len(packages) == 1 {
-		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp")
+		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp", "discord.py")
 	}
 
 	args := append([]string{"-m", "pip", "install", "--quiet", "--user"}, packages...)

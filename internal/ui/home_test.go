@@ -2,11 +2,14 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -24,6 +27,57 @@ func TestNewHome(t *testing.T) {
 	}
 	if home.newDialog == nil {
 		t.Error("NewDialog component should be initialized")
+	}
+}
+
+func TestNewHome_DisablesTmuxNotificationsWhenStatusInjectionDisabled(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpHome := t.TempDir()
+	os.Setenv("HOME", tmpHome)
+	session.ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		session.ClearUserConfigCache()
+	}()
+
+	configDir := filepath.Join(tmpHome, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() failed: %v", err)
+	}
+	configPath := filepath.Join(configDir, "config.toml")
+	config := "[tmux]\ninject_status_line = false\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	home := NewHome()
+	if home.manageTmuxNotifications {
+		t.Fatal("manageTmuxNotifications should be false when inject_status_line is disabled")
+	}
+	if home.notificationsEnabled {
+		t.Fatal("notificationsEnabled should stay false when tmux status injection is disabled")
+	}
+	if home.notificationManager != nil {
+		t.Fatal("notificationManager should not initialize when tmux status injection is disabled")
+	}
+}
+
+func TestApplyCreateSessionToolOverrides_GeminiExplicitFalsePersists(t *testing.T) {
+	inst := session.NewInstanceWithTool("gemini-test", "/tmp/test", "gemini")
+	applyCreateSessionToolOverrides(inst, "gemini", false)
+	if inst.GeminiYoloMode == nil {
+		t.Fatal("GeminiYoloMode should be set when Gemini YOLO is explicitly disabled")
+	}
+	if *inst.GeminiYoloMode {
+		t.Fatal("GeminiYoloMode should be false when Gemini YOLO is explicitly disabled")
+	}
+}
+
+func TestApplyCreateSessionToolOverrides_NonGeminiNoop(t *testing.T) {
+	inst := session.NewInstanceWithTool("claude-test", "/tmp/test", "claude")
+	applyCreateSessionToolOverrides(inst, "claude", true)
+	if inst.GeminiYoloMode != nil {
+		t.Fatalf("GeminiYoloMode = %v, want nil for non-gemini tools", inst.GeminiYoloMode)
 	}
 }
 
@@ -48,6 +102,59 @@ func TestHomeView(t *testing.T) {
 	if view == "Loading..." {
 		// Initial state is OK
 		return
+	}
+}
+
+func TestHomeView_StaysWithinBoundsWhileNavigating(t *testing.T) {
+	home := NewHome()
+	home.width = 200
+	home.height = 55
+	home.initialLoading = false
+
+	instances := []*session.Instance{
+		session.NewInstanceWithTool("conductor-ryan", "/tmp/conductor", "claude"),
+		session.NewInstanceWithTool("copy from server", "/tmp/social-copy", "claude"),
+		session.NewInstanceWithTool("test", "/tmp/social-test", "claude"),
+		session.NewInstanceWithTool("vscode on linux", "/tmp/linux", "claude"),
+		session.NewInstanceWithTool("about gsd", "/tmp/about-gsd", "claude"),
+		session.NewInstanceWithTool("places to work from", "/tmp/places", "claude"),
+	}
+
+	instances[0].GroupPath = "conductor"
+	for _, inst := range instances[1:] {
+		inst.GroupPath = "Social Monitor"
+	}
+	instances[3].Status = session.StatusError
+
+	home.instancesMu.Lock()
+	home.instances = instances
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(instances)
+	home.rebuildFlatItems()
+
+	if len(home.flatItems) == 0 {
+		t.Fatal("expected flatItems to be populated")
+	}
+
+	for cursor := range home.flatItems {
+		home.cursor = cursor
+		view := home.View()
+		assertViewWithinBounds(t, view, home.width, home.height, fmt.Sprintf("cursor=%d type=%v", cursor, home.flatItems[cursor].Type))
+	}
+}
+
+func assertViewWithinBounds(t *testing.T, view string, width, height int, context string) {
+	t.Helper()
+
+	lines := strings.Split(view, "\n")
+	if len(lines) != height {
+		t.Fatalf("%s: line count = %d, want %d", context, len(lines), height)
+	}
+
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("%s: line %d width = %d, want <= %d\nline=%q", context, i, got, width, line)
+		}
 	}
 }
 
@@ -599,6 +706,476 @@ func TestGetLayoutMode(t *testing.T) {
 	}
 }
 
+func TestHandleMainKeyEditNotesStartsEditor(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:    "session-notes",
+		Title: "Session With Notes",
+		Tool:  "claude",
+		Notes: "existing notes",
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+
+	if !h.notesEditing {
+		t.Fatal("notes editor should be active after pressing edit hotkey")
+	}
+	if h.notesEditingSessionID != inst.ID {
+		t.Fatalf("notes editing session = %q, want %q", h.notesEditingSessionID, inst.ID)
+	}
+	if got := h.notesEditor.Value(); got != inst.Notes {
+		t.Fatalf("notes editor value = %q, want %q", got, inst.Notes)
+	}
+}
+
+func TestHandleNotesEditorKeySave(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+	home.storage = nil // Avoid touching persistence in this unit test.
+
+	inst := &session.Instance{
+		ID:    "session-save-notes",
+		Title: "Save Notes",
+		Tool:  "claude",
+		Notes: "before",
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+	home.beginNotesEditing(inst)
+	home.notesEditor.SetValue("after")
+
+	model, _ := home.handleNotesEditorKey(tea.KeyMsg{Type: tea.KeyCtrlS})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleNotesEditorKey should return *Home")
+	}
+
+	if got := inst.Notes; got != "after" {
+		t.Fatalf("session notes = %q, want %q", got, "after")
+	}
+	if h.notesEditing {
+		t.Fatal("notes editor should close after save")
+	}
+}
+
+func TestNotesSectionLineBudget(t *testing.T) {
+	tests := []struct {
+		name          string
+		remaining     int
+		reserveOutput bool
+		split         float64
+		want          int
+	}{
+		{name: "none", remaining: 0, reserveOutput: true, split: 0.33, want: 0},
+		{name: "default split", remaining: 20, reserveOutput: true, split: 0.33, want: 6},
+		{name: "clamp minimum", remaining: 5, reserveOutput: true, split: 0.1, want: 2},
+		{name: "clamp maximum", remaining: 10, reserveOutput: true, split: 0.9, want: 7},
+		{name: "no output reserve", remaining: 8, reserveOutput: false, split: 0.33, want: 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := notesSectionLineBudget(tt.remaining, tt.reserveOutput, tt.split); got != tt.want {
+				t.Fatalf("notesSectionLineBudget(%d,%v,%v) = %d, want %d", tt.remaining, tt.reserveOutput, tt.split, got, tt.want)
+			}
+		})
+	}
+}
+
+func setFollowCwdOnAttachConfigForTest(t *testing.T, enabled *bool) {
+	t.Helper()
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	configDir := filepath.Join(homeDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("failed to create config directory: %v", err)
+	}
+
+	if enabled != nil {
+		value := "false"
+		if *enabled {
+			value = "true"
+		}
+		content := fmt.Sprintf("[instances]\nfollow_cwd_on_attach = %s\n", value)
+		configPath := filepath.Join(configDir, session.UserConfigFileName)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("failed to write config.toml: %v", err)
+		}
+	}
+
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+}
+
+func setPreviewShowNotesConfigForTest(t *testing.T, enabled *bool) {
+	t.Helper()
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	configDir := filepath.Join(homeDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("failed to create config directory: %v", err)
+	}
+
+	if enabled != nil {
+		value := "false"
+		if *enabled {
+			value = "true"
+		}
+		content := fmt.Sprintf("[preview]\nshow_notes = %s\n", value)
+		configPath := filepath.Join(configDir, session.UserConfigFileName)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("failed to write config.toml: %v", err)
+		}
+	}
+
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+}
+
+func TestFollowAttachReturnCwdEnabledUpdatesProjectPath(t *testing.T) {
+	enabled := true
+	setFollowCwdOnAttachConfigForTest(t, &enabled)
+
+	home := NewHome()
+	home.storage = nil // Prevent persistence side effects in this unit test.
+
+	initialDir := t.TempDir()
+	inst := session.NewInstance("follow-cwd", initialDir)
+	newDir := t.TempDir()
+
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+
+	home.followAttachReturnCwd(statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: newDir})
+
+	want := filepath.Clean(newDir)
+	if got := inst.ProjectPath; got != want {
+		t.Fatalf("project path = %q, want %q", got, want)
+	}
+	tmuxSess := inst.GetTmuxSession()
+	if tmuxSess == nil {
+		t.Fatal("tmux session should be initialized")
+	}
+	if got := tmuxSess.WorkDir; got != want {
+		t.Fatalf("tmux work dir = %q, want %q", got, want)
+	}
+}
+
+func TestFollowAttachReturnCwdDisabledDoesNotUpdateProjectPath(t *testing.T) {
+	disabled := false
+	setFollowCwdOnAttachConfigForTest(t, &disabled)
+
+	home := NewHome()
+	home.storage = nil
+
+	initialDir := t.TempDir()
+	inst := session.NewInstance("no-follow-cwd", initialDir)
+	newDir := t.TempDir()
+
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+
+	home.followAttachReturnCwd(statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: newDir})
+
+	if got := inst.ProjectPath; got != initialDir {
+		t.Fatalf("project path changed = %q, want %q", got, initialDir)
+	}
+}
+
+func TestFollowAttachReturnCwdRejectsInvalidPaths(t *testing.T) {
+	enabled := true
+	setFollowCwdOnAttachConfigForTest(t, &enabled)
+
+	tests := []struct {
+		name    string
+		workDir string
+	}{
+		{name: "relative", workDir: "relative/path"},
+		{name: "missing", workDir: filepath.Join(t.TempDir(), "missing")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := NewHome()
+			home.storage = nil
+
+			initialDir := t.TempDir()
+			inst := session.NewInstance("reject-path", initialDir)
+
+			home.instancesMu.Lock()
+			home.instances = []*session.Instance{inst}
+			home.instanceByID[inst.ID] = inst
+			home.instancesMu.Unlock()
+
+			home.followAttachReturnCwd(statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: tt.workDir})
+
+			if got := inst.ProjectPath; got != initialDir {
+				t.Fatalf("project path changed = %q, want %q", got, initialDir)
+			}
+		})
+	}
+}
+
+func TestHandleMainKeyEditNotesDisabledWhenShowNotesFalse(t *testing.T) {
+	disabled := false
+	setPreviewShowNotesConfigForTest(t, &disabled)
+
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := session.NewInstance("notes-disabled", t.TempDir())
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if h.notesEditing {
+		t.Fatal("notes editor should remain disabled when show_notes=false")
+	}
+	if h.notesEditingSessionID != "" {
+		t.Fatalf("notesEditingSessionID = %q, want empty", h.notesEditingSessionID)
+	}
+}
+
+func TestRenderSessionListEmptyUsesConfiguredKeys(t *testing.T) {
+	home := NewHome()
+	home.setHotkeys(resolveHotkeys(map[string]string{
+		hotkeyNewSession:  "a",
+		hotkeyImport:      "b",
+		hotkeyCreateGroup: "c",
+	}))
+
+	rendered := home.renderSessionList(60, 22)
+
+	for _, want := range []string{
+		"Press a to create a new session",
+		"Press b to import existing tmux sessions",
+		"Press c to create a group",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("empty state missing hint %q\nrendered=%q", want, rendered)
+		}
+	}
+}
+
+func TestRenderSessionListEmptyWithUnboundPrimaryActions(t *testing.T) {
+	home := NewHome()
+	home.setHotkeys(resolveHotkeys(map[string]string{
+		hotkeyNewSession:  "",
+		hotkeyImport:      "",
+		hotkeyCreateGroup: "",
+	}))
+
+	rendered := home.renderSessionList(60, 22)
+
+	if !strings.Contains(rendered, "Create or import sessions to get started") {
+		t.Fatalf("empty state should show fallback hint when all actions are unbound\nrendered=%q", rendered)
+	}
+}
+
+func TestSessionClosedMsgUsesConfiguredRestartHint(t *testing.T) {
+	home := NewHome()
+	home.storage = nil
+	home.setHotkeys(resolveHotkeys(map[string]string{hotkeyRestart: "ctrl+r"}))
+
+	inst := session.NewInstance("closed-session", t.TempDir())
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+
+	model, _ := home.Update(sessionClosedMsg{sessionID: inst.ID})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("Update should return *Home")
+	}
+
+	if h.err == nil {
+		t.Fatal("expected close-session message to be set")
+	}
+	if !strings.Contains(h.err.Error(), "ctrl+r to restart") {
+		t.Fatalf("close-session message should use configured restart key, got %q", h.err.Error())
+	}
+}
+
+func TestDeleteAndCloseSessionUseDistinctActions(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := session.NewInstance("actions-session", t.TempDir())
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if !h.confirmDialog.IsVisible() {
+		t.Fatal("delete should show confirmation dialog")
+	}
+	if got := h.confirmDialog.GetConfirmType(); got != ConfirmDeleteSession {
+		t.Fatalf("confirm type after delete = %v, want %v", got, ConfirmDeleteSession)
+	}
+
+	h.confirmDialog.Hide()
+
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	h, ok = model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if !h.confirmDialog.IsVisible() {
+		t.Fatal("close should show confirmation dialog")
+	}
+	if got := h.confirmDialog.GetConfirmType(); got != ConfirmCloseSession {
+		t.Fatalf("confirm type after close = %v, want %v", got, ConfirmCloseSession)
+	}
+}
+
+func TestDeleteHotkeyRemapAndCloseUnbind(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+	home.setHotkeys(resolveHotkeys(map[string]string{
+		hotkeyDelete:       "backspace",
+		hotkeyCloseSession: "",
+	}))
+
+	inst := session.NewInstance("actions-remap", t.TempDir())
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if h.confirmDialog.IsVisible() {
+		t.Fatal("unbound close_session key should not open confirmation")
+	}
+
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	h, ok = model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if !h.confirmDialog.IsVisible() {
+		t.Fatal("remapped delete key should show confirmation dialog")
+	}
+	if got := h.confirmDialog.GetConfirmType(); got != ConfirmDeleteSession {
+		t.Fatalf("confirm type after remapped delete = %v, want %v", got, ConfirmDeleteSession)
+	}
+}
+
+func TestRemoteDeleteAndCloseUseDistinctActions(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if !h.confirmDialog.IsVisible() {
+		t.Fatal("delete should show confirmation dialog")
+	}
+	if got := h.confirmDialog.GetConfirmType(); got != ConfirmDeleteRemoteSession {
+		t.Fatalf("confirm type after delete = %v, want %v", got, ConfirmDeleteRemoteSession)
+	}
+	if got := h.confirmDialog.GetRemoteName(); got != "myserver" {
+		t.Fatalf("remote name after delete = %q, want %q", got, "myserver")
+	}
+
+	h.confirmDialog.Hide()
+
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	h, ok = model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if !h.confirmDialog.IsVisible() {
+		t.Fatal("close should show confirmation dialog")
+	}
+	if got := h.confirmDialog.GetConfirmType(); got != ConfirmCloseRemoteSession {
+		t.Fatalf("confirm type after close = %v, want %v", got, ConfirmCloseRemoteSession)
+	}
+	if got := h.confirmDialog.GetRemoteName(); got != "myserver" {
+		t.Fatalf("remote name after close = %q, want %q", got, "myserver")
+	}
+}
+
+func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd == nil {
+		t.Fatal("restart should return a command")
+	}
+
+	msg := cmd()
+	restartMsg, ok := msg.(remoteSessionRestartedMsg)
+	if !ok {
+		t.Fatalf("command returned %T, want remoteSessionRestartedMsg", msg)
+	}
+	if restartMsg.remoteName != "myserver" {
+		t.Fatalf("remoteName = %q, want %q", restartMsg.remoteName, "myserver")
+	}
+	if restartMsg.sessionID != "remote-123" {
+		t.Fatalf("sessionID = %q, want %q", restartMsg.sessionID, "remote-123")
+	}
+	if restartMsg.title != "remote-session" {
+		t.Fatalf("title = %q, want %q", restartMsg.title, "remote-session")
+	}
+	if restartMsg.err == nil {
+		t.Fatal("expected error when remote config is unavailable")
+	}
+
+	_ = h
+}
+
 func TestRenderHelpBarTiny(t *testing.T) {
 	home := NewHome()
 	home.width = 45 // Tiny mode (<50 cols)
@@ -616,6 +1193,30 @@ func TestRenderHelpBarTiny(t *testing.T) {
 	}
 	if strings.Contains(result, "Global") {
 		t.Error("Tiny help bar should not contain 'Global'")
+	}
+}
+
+func TestRenderHelpBarTinyUsesConfiguredHelpKey(t *testing.T) {
+	home := NewHome()
+	home.width = 45
+	home.height = 30
+	home.setHotkeys(resolveHotkeys(map[string]string{"help": "h"}))
+
+	result := home.renderHelpBar()
+	if !strings.Contains(result, "h for help") {
+		t.Fatalf("tiny help bar should use remapped help key, got %q", result)
+	}
+}
+
+func TestRenderHelpBarTinyHandlesUnboundHelpKey(t *testing.T) {
+	home := NewHome()
+	home.width = 45
+	home.height = 30
+	home.setHotkeys(resolveHotkeys(map[string]string{"help": ""}))
+
+	result := home.renderHelpBar()
+	if !strings.Contains(result, "Help key unbound") {
+		t.Fatalf("tiny help bar should show unbound message, got %q", result)
 	}
 }
 
@@ -801,6 +1402,70 @@ func TestHomeViewStackedLayout(t *testing.T) {
 	}
 	if strings.Contains(view, "Terminal too small") {
 		t.Error("65-col terminal should not show 'too small' error")
+	}
+}
+
+func TestHomeViewUsesCachedPreviewDuringNavigationBursts(t *testing.T) {
+	tests := []struct {
+		name   string
+		width  int
+		height int
+	}{
+		{name: "dual layout", width: 100, height: 30},
+		{name: "stacked layout", width: 65, height: 50},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := NewHome()
+			home.width = tt.width
+			home.height = tt.height
+			home.initialLoading = false
+
+			inst := session.NewInstanceWithTool("Preview Session", "/tmp/project", "other")
+			inst.ID = "preview-session"
+			inst.Status = session.StatusIdle
+			inst.CreatedAt = time.Now().Add(-time.Minute)
+
+			home.instancesMu.Lock()
+			home.instances = []*session.Instance{inst}
+			home.instanceByID[inst.ID] = inst
+			home.instancesMu.Unlock()
+			home.groupTree = session.NewGroupTree(home.instances)
+			home.rebuildFlatItems()
+			home.refreshSessionRenderSnapshot(home.instances)
+			for i, item := range home.flatItems {
+				if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == inst.ID {
+					home.cursor = i
+					break
+				}
+			}
+
+			home.previewCacheMu.Lock()
+			home.previewCache[inst.ID] = "cached preview content that should remain visible immediately"
+			home.previewCacheTime[inst.ID] = time.Now()
+			home.previewCacheMu.Unlock()
+
+			home.isNavigating = true
+			home.lastNavigationTime = time.Now()
+			home.lastAttachReturn = time.Now()
+			home.navigationHotUntil.Store(time.Now().Add(900 * time.Millisecond).UnixNano())
+
+			view := home.View()
+
+			if !strings.Contains(view, "cached preview content") {
+				t.Fatalf("View() should render cached preview content during navigation burst:\n%s", view)
+			}
+			if strings.Contains(view, "Preview paused while navigating...") {
+				t.Fatalf("View() should not suppress preview pane during navigation burst:\n%s", view)
+			}
+			if strings.Contains(view, "Moving... preview updating") {
+				t.Fatalf("View() should not replace cached preview during navigation burst:\n%s", view)
+			}
+			if strings.Contains(view, "Returned from session... refreshing preview") {
+				t.Fatalf("View() should not hide cached preview after attach return:\n%s", view)
+			}
+		})
 	}
 }
 

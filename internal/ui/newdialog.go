@@ -95,7 +95,7 @@ type dialogSnapshot struct {
 // buildPresetCommands returns the list of commands for the picker,
 // including any custom tools from config.toml.
 func buildPresetCommands() []string {
-	presets := []string{"", "claude", "gemini", "opencode", "codex"}
+	presets := []string{"", "claude", "gemini", "opencode", "codex", "pi"}
 	if customTools := session.GetCustomToolNames(); len(customTools) > 0 {
 		presets = append(presets, customTools...)
 	}
@@ -215,6 +215,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.worktreeEnabled = false
 	d.branchInput.SetValue("")
 	d.branchAutoSet = false
+	d.branchPrefix = "feature/" // default; overridden below if config provides one.
 	// Reset sandbox from global config default.
 	d.sandboxEnabled = false
 	d.inheritedExpanded = false
@@ -238,6 +239,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 		d.claudeOptions.SetDefaults(userConfig)
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
+		d.branchPrefix = userConfig.Worktree.Prefix()
 	}
 	// Load branch prefix from worktree config.
 	wtSettings := session.GetWorktreeSettings()
@@ -371,8 +373,8 @@ func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 
 	// Apply tool-specific options
 	if len(rs.ToolOptions) > 0 && string(rs.ToolOptions) != "{}" {
-		switch rs.Tool {
-		case "claude":
+		switch {
+		case session.IsClaudeCompatible(rs.Tool):
 			var wrapper session.ToolOptionsWrapper
 			if err := json.Unmarshal(rs.ToolOptions, &wrapper); err == nil && wrapper.Tool == "claude" {
 				var opts session.ClaudeOptions
@@ -380,11 +382,11 @@ func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 					d.claudeOptions.SetFromOptions(&opts)
 				}
 			}
-		case "gemini":
+		case rs.Tool == "gemini":
 			if rs.GeminiYoloMode != nil {
 				d.geminiOptions.SetDefaults(*rs.GeminiYoloMode)
 			}
-		case "codex":
+		case rs.Tool == "codex":
 			var wrapper session.ToolOptionsWrapper
 			if err := json.Unmarshal(rs.ToolOptions, &wrapper); err == nil && wrapper.Tool == "codex" {
 				var opts session.CodexOptions
@@ -475,7 +477,7 @@ func (d *NewDialog) ToggleWorktree() {
 	d.rebuildFocusTargets()
 }
 
-// autoBranchFromName sets the branch input to "feature/<session-name>" if the
+// autoBranchFromName sets the branch input to "<prefix><session-name>" if the
 // name field is non-empty and the branch hasn't been manually edited.
 func (d *NewDialog) autoBranchFromName() {
 	name := strings.TrimSpace(d.nameInput.Value())
@@ -537,9 +539,12 @@ func (d *NewDialog) GetClaudeOptions() *session.ClaudeOptions {
 	return d.claudeOptions.GetOptions()
 }
 
-// isClaudeSelected returns true if "claude" is the selected command
+// isClaudeSelected returns true if the selected command is Claude or a claude-compatible custom tool
 func (d *NewDialog) isClaudeSelected() bool {
-	return d.commandCursor < len(d.presetCommands) && d.presetCommands[d.commandCursor] == "claude"
+	if d.commandCursor < 0 || d.commandCursor >= len(d.presetCommands) {
+		return false
+	}
+	return session.IsClaudeCompatible(d.presetCommands[d.commandCursor])
 }
 
 // Validate checks if the dialog values are valid and returns an error message if not
@@ -630,12 +635,13 @@ func (d *NewDialog) rebuildFocusTargets() {
 
 // updateToolOptions sets d.toolOptions to the panel matching the current tool selection.
 func (d *NewDialog) updateToolOptions() {
-	switch d.GetSelectedCommand() {
-	case "claude":
+	cmd := d.GetSelectedCommand()
+	switch {
+	case session.IsClaudeCompatible(cmd):
 		d.toolOptions = d.claudeOptions
-	case "gemini":
+	case cmd == "gemini":
 		d.toolOptions = d.geminiOptions
-	case "codex":
+	case cmd == "codex":
 		d.toolOptions = d.codexOptions
 	default:
 		d.toolOptions = nil

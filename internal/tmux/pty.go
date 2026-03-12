@@ -4,6 +4,7 @@
 package tmux
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -133,8 +134,19 @@ func (s *Session) Attach(ctx context.Context) error {
 				continue
 			}
 
-			// Check for Ctrl+Q (ASCII 17) - single byte
-			if n == 1 && buf[0] == 17 {
+			// Check for Ctrl+Q (ASCII 17) anywhere in the input chunk.
+			// Some terminals coalesce reads, so detach must not require a single-byte read.
+			if idx := bytes.IndexByte(buf[:n], 17); idx >= 0 {
+				// Forward any bytes before Ctrl+Q, then detach.
+				if idx > 0 {
+					if _, err := ptmx.Write(buf[:idx]); err != nil {
+						select {
+						case ioErrors <- fmt.Errorf("PTY write error: %w", err):
+						default:
+						}
+						return
+					}
+				}
 				close(detachCh)
 				cancel()
 				return
@@ -168,7 +180,7 @@ func (s *Session) Attach(ctx context.Context) error {
 		_ = ptmx.Close()
 		select {
 		case <-outputDone:
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(20 * time.Millisecond):
 		}
 		// Reset OSC-8 hyperlink state + SGR attributes before Bubble Tea redraws.
 		_, _ = os.Stdout.WriteString(terminalStyleReset)
@@ -205,6 +217,22 @@ func (s *Session) Attach(ctx context.Context) error {
 
 	cleanupAttach()
 	return attachErr
+}
+
+// AttachWindow attaches to a specific window within this tmux session.
+// Selects the target window first, then uses the standard Attach flow.
+func (s *Session) AttachWindow(ctx context.Context, windowIndex int) error {
+	if !s.Exists() {
+		return fmt.Errorf("session %s does not exist", s.Name)
+	}
+
+	// Select the target window before attaching
+	target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
+	if err := exec.Command("tmux", "select-window", "-t", target).Run(); err != nil {
+		return fmt.Errorf("failed to select window %s: %w", target, err)
+	}
+
+	return s.Attach(ctx)
 }
 
 // Resize changes the terminal size of the tmux session

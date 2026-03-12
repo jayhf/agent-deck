@@ -289,7 +289,7 @@ func TestGetHeartbeatInterval(t *testing.T) {
 		interval int
 		expected int
 	}{
-		{0, 15},  // default
+		{0, 0},   // zero means disabled
 		{-1, 15}, // negative defaults to 15
 		{10, 10}, // custom
 		{30, 30}, // custom
@@ -533,13 +533,15 @@ func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 	}
 }
 
-func TestBridgeTemplate_HeartbeatSelectsOnePerProfile(t *testing.T) {
+func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
 	template := conductorBridgePy
 
 	patterns := []string{
 		"def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:",
 		"conductors = select_heartbeat_conductors(all_conductors)",
-		"Multiple conductors may share a profile. Heartbeat auto-actions are profile-wide,",
+		`s_group = s.get("group", "") or ""`,
+		`if s_group != name and not s_group.startswith(f"{name}/"):`,
+		`for s in scoped_sessions:`,
 	}
 
 	for _, pattern := range patterns {
@@ -1722,6 +1724,119 @@ func TestConductorMeta_GetClearOnCompact(t *testing.T) {
 	}
 }
 
+// --- Discord bridge template tests ---
+
+func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"HAS_DISCORD",
+		"create_discord_bot",
+		"DISCORD_MAX_LENGTH",
+		"class ConductorBot(discord.Client):",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
+	template := conductorBridgePy
+
+	// Check for authorization function
+	if !strings.Contains(template, "def is_authorized(user_id: int) -> bool:") {
+		t.Error("template should contain is_authorized function for Discord")
+	}
+
+	// Check for unauthorized message logging
+	if !strings.Contains(template, "Unauthorized Discord message from user") {
+		t.Error("template should log unauthorized Discord messages")
+	}
+}
+
+func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`dc = conductor_cfg.get("discord", {})`,
+		`dc_bot_token = dc.get("bot_token", "")`,
+		`dc_guild_id = dc.get("guild_id", 0)`,
+		`dc_channel_id = dc.get("channel_id", 0)`,
+		`dc_user_id = dc.get("user_id", 0)`,
+		`"discord":`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord config pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
+	template := conductorBridgePy
+	commands := []string{
+		`name="ad-status"`,
+		`name="ad-sessions"`,
+		`name="ad-restart"`,
+		`name="ad-help"`,
+	}
+	for _, cmd := range commands {
+		if !strings.Contains(template, cmd) {
+			t.Errorf("template should contain Discord slash command: %q", cmd)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"async def ensure_discord_channel(interaction: discord.Interaction) -> bool:",
+		`if interaction.channel_id != channel_id:`,
+		`"This command is only available in the configured channel."`,
+		"if not await ensure_discord_channel(interaction):",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord channel restriction pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "discord_bot=None, discord_channel_id=None") {
+		t.Error("heartbeat_loop should accept discord_bot and discord_channel_id params")
+	}
+	if !strings.Contains(template, "Failed to send Discord notification") {
+		t.Error("heartbeat should handle Discord notification errors")
+	}
+}
+
+func TestBridgeTemplate_DiscordInMain(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`dc_ok = config["discord"]["configured"] and HAS_DISCORD`,
+		"create_discord_bot(config)",
+		`discord_bot.start(config["discord"]["bot_token"])`,
+		"discord_bot.close()",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("main() should contain Discord pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "async with message.channel.typing():") {
+		t.Error("Discord on_message should show typing indicator while waiting for conductor response")
+	}
+	if !strings.Contains(template, "run_in_executor") {
+		t.Error("Discord on_message should offload blocking send_to_conductor to thread executor")
+	}
+}
+
 func TestConductorClearOnCompact(t *testing.T) {
 	// Override HOME so LoadConductorMeta reads from our temp dir
 	tmpHome := t.TempDir()
@@ -1760,5 +1875,56 @@ func TestConductorClearOnCompact(t *testing.T) {
 	nonConductor := &Instance{Title: "my-session", GroupPath: "conductor"}
 	if nonConductor.ConductorClearOnCompact() {
 		t.Error("non-conductor-prefixed title should return false")
+	}
+}
+
+// TestConductorHeartbeatScript_GroupScoped verifies the heartbeat script references
+// the conductor's own group (not all sessions in the profile) and includes an
+// enabled-config guard.
+func TestConductorHeartbeatScript_GroupScoped(t *testing.T) {
+	// The heartbeat message must NOT reference "all sessions in the {PROFILE} profile"
+	if strings.Contains(conductorHeartbeatScript, "Check all sessions in the") {
+		t.Fatal("heartbeat script should NOT reference 'all sessions in the {PROFILE} profile'; must be group-scoped")
+	}
+
+	// The heartbeat message must reference the conductor's own group via {NAME}
+	if !strings.Contains(conductorHeartbeatScript, "{NAME}") {
+		t.Fatal("heartbeat script must reference {NAME} for group scoping")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "Check sessions in") {
+		t.Fatal("heartbeat script should contain group-scoped message like 'Check sessions in'")
+	}
+
+	// The script must contain an enabled-config guard that queries conductor status
+	if !strings.Contains(conductorHeartbeatScript, "ENABLED") {
+		t.Fatal("heartbeat script must contain an ENABLED guard that checks conductor status before sending")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "conductor status") {
+		t.Fatal("heartbeat script must query conductor status to determine if enabled")
+	}
+}
+
+// TestGetHeartbeatInterval_ZeroMeansDisabled verifies interval=0 means disabled,
+// negative means use default, and positive means use the configured value.
+func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval int
+		expected int
+	}{
+		{"zero means disabled", 0, 0},
+		{"negative means default", -1, 15},
+		{"custom value", 30, 30},
+		{"explicit default", 15, 15},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := ConductorSettings{HeartbeatInterval: tt.interval}
+			got := settings.GetHeartbeatInterval()
+			if got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
+			}
+		})
 	}
 }

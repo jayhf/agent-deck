@@ -29,7 +29,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-const Version = "0.20.0"
+const Version = "0.25.1"
 
 // Table column widths for list command output
 const (
@@ -250,6 +250,9 @@ func main() {
 		case "conductor":
 			handleConductor(profile, args[1:])
 			return
+		case "openclaw", "oc":
+			handleOpenClaw(profile, args[1:])
+			return
 		case "remote":
 			handleRemote(profile, args[1:])
 			return
@@ -274,6 +277,9 @@ func main() {
 			return
 		case "codex-hooks":
 			handleCodexHooks(args[1:])
+			return
+		case "gemini-hooks":
+			handleGeminiHooks(args[1:])
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
@@ -689,7 +695,7 @@ func handleAdd(profile string, args []string) {
 	)
 	parent := fs.String("parent", "", "Parent session (creates sub-session, inherits group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
-	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking")
+	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking (use 'session set-parent' later to link manually)")
 	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
 	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -720,6 +726,8 @@ func handleAdd(profile string, args []string) {
 
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume (skips new session creation)")
+	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode for Gemini or Codex sessions")
+	geminiYoloMode := fs.Bool("gemini-yolo", false, "Enable YOLO mode (alias for --yolo)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck add [path] [options]")
@@ -742,6 +750,8 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
 		fmt.Println("  agent-deck add -c opencode --wrapper \"nvim +'terminal {command}' +'startinsert'\" .")
 		fmt.Println("  agent-deck add -c \"codex --dangerously-bypass-approvals-and-sandbox\" .")
+		fmt.Println("  agent-deck add -c gemini --yolo .")
+		fmt.Println("  agent-deck add -c claude -g work .   # -c is shorthand for --cmd")
 		fmt.Println("  agent-deck add -g ard --no-parent -c claude .")
 		fmt.Println("  agent-deck add --quick -c claude .   # Auto-generated name")
 		fmt.Println()
@@ -1050,6 +1060,11 @@ func handleAdd(profile string, args []string) {
 		if err := newInstance.SetClaudeOptions(opts); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to set resume options: %v\n", err)
 		}
+	}
+
+	if err := applyCLIYoloOverride(newInstance, *yoloMode || *geminiYoloMode); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Add to instances
@@ -1592,6 +1607,7 @@ type statusCounts struct {
 	waiting int
 	idle    int
 	err     int
+	stopped int
 	total   int
 }
 
@@ -1609,6 +1625,8 @@ func countByStatus(instances []*session.Instance) statusCounts {
 			counts.idle++
 		case session.StatusError:
 			counts.err++
+		case session.StatusStopped:
+			counts.stopped++
 		}
 		counts.total++
 	}
@@ -1658,7 +1676,7 @@ func handleStatus(profile string, args []string) {
 
 	if len(instances) == 0 {
 		if *jsonOutput {
-			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "total": 0}`)
+			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "stopped": 0, "total": 0}`)
 		} else if *quiet || *quietShort {
 			fmt.Println("0")
 		} else {
@@ -1677,6 +1695,7 @@ func handleStatus(profile string, args []string) {
 			Running int `json:"running"`
 			Idle    int `json:"idle"`
 			Error   int `json:"error"`
+			Stopped int `json:"stopped"`
 			Total   int `json:"total"`
 		}
 		output, _ := json.Marshal(statusJSON{
@@ -1684,6 +1703,7 @@ func handleStatus(profile string, args []string) {
 			Running: counts.running,
 			Idle:    counts.idle,
 			Error:   counts.err,
+			Stopped: counts.stopped,
 			Total:   counts.total,
 		})
 		fmt.Println(string(output))
@@ -1716,6 +1736,7 @@ func handleStatus(profile string, args []string) {
 		printStatusGroup("WAITING", "◐", session.StatusWaiting)
 		printStatusGroup("RUNNING", "●", session.StatusRunning)
 		printStatusGroup("IDLE", "○", session.StatusIdle)
+		printStatusGroup("STOPPED", "■", session.StatusStopped)
 		printStatusGroup("ERROR", "✕", session.StatusError)
 
 		fmt.Printf("Total: %d sessions in profile '%s'\n", counts.total, storage.Profile())
@@ -2048,6 +2069,9 @@ func handleUpdate(args []string) {
 
 	fmt.Printf("\n✓ Updated to v%s\n", info.LatestVersion)
 	fmt.Println("  Restart agent-deck to use the new version.")
+
+	// Offer to update remotes
+	updateRemotesAfterLocalUpdate(info.LatestVersion)
 }
 
 func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
@@ -2142,6 +2166,7 @@ func printHelp() {
 	fmt.Println("  mcp              Manage MCP servers")
 	fmt.Println("  skill            Manage Claude skills")
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
+	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
@@ -2177,6 +2202,9 @@ func printHelp() {
 	fmt.Println("  codex-hooks install       Install or upgrade Codex notify hook")
 	fmt.Println("  codex-hooks uninstall     Remove Codex notify hook")
 	fmt.Println("  codex-hooks status        Show Codex hook install status")
+	fmt.Println("  gemini-hooks install      Install Gemini hooks")
+	fmt.Println("  gemini-hooks uninstall    Remove Gemini hooks")
+	fmt.Println("  gemini-hooks status       Show Gemini hooks install status")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")

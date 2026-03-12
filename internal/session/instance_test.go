@@ -5,10 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/stretchr/testify/require"
 )
 
@@ -184,6 +187,38 @@ func TestInstance_Fork_ExplicitConfig(t *testing.T) {
 	// When explicitly configured, CLAUDE_CONFIG_DIR SHOULD be set
 	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
 		t.Errorf("Fork() should set CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
+	}
+}
+
+func TestInstance_CreateForkedInstance_ExportsForkedInstanceID(t *testing.T) {
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	forked, cmd, err := inst.CreateForkedInstance("forked-test", "")
+	if err != nil {
+		t.Fatalf("CreateForkedInstance() failed: %v", err)
+	}
+
+	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + forked.ID
+	if !strings.Contains(cmd, expectedPrefix) {
+		t.Fatalf("Fork command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+	if strings.Contains(cmd, "AGENTDECK_INSTANCE_ID="+inst.ID) {
+		t.Fatalf("Fork command should not export the parent instance ID, got: %s", cmd)
 	}
 }
 
@@ -409,10 +444,7 @@ func TestBuildClaudeCommand_ExplicitConfig(t *testing.T) {
 	}
 }
 
-// TestBuildClaudeCommand_CustomAlias tests that capture-resume commands always use
-// "claude" binary + CLAUDE_CONFIG_DIR, NOT the custom alias (aliases don't work in bash -c)
 func TestBuildClaudeCommand_CustomAlias(t *testing.T) {
-	// Create temp config with custom command
 	origHome := os.Getenv("HOME")
 	tmpDir := t.TempDir()
 	os.Setenv("HOME", tmpDir)
@@ -439,11 +471,8 @@ config_dir = "~/.claude-work"
 	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
 	cmd := inst.buildClaudeCommand("claude")
 
-	// Should use "claude" binary (NOT "cdw" alias) for capture-resume commands
-	// Reason: Commands with $(...) get wrapped in `bash -c` for fish compatibility (#47),
-	// and shell aliases are not available in non-interactive bash shells
-	if strings.Contains(cmd, "cdw") {
-		t.Errorf("Should NOT use alias 'cdw' in capture-resume command (aliases don't work in bash -c), got: %s", cmd)
+	if !strings.Contains(cmd, "cdw") {
+		t.Errorf("Should use custom command 'cdw' from config, got: %s", cmd)
 	}
 
 	// Should include CLAUDE_CONFIG_DIR since config_dir is explicitly set
@@ -2188,6 +2217,8 @@ func TestNewSandboxConfig(t *testing.T) {
 			require.Equal(t, tc.wantEnabled, cfg.Enabled)
 			if tc.imageOverride != "" {
 				require.Equal(t, tc.imageOverride, cfg.Image)
+			} else {
+				require.Equal(t, docker.DefaultImage(), cfg.Image)
 			}
 		})
 	}
@@ -2433,6 +2464,110 @@ func writeCodexSessionFile(t *testing.T, codexHome, sessionID, cwd string) strin
 	return filePath
 }
 
+func TestExtractCodexSessionIDFromLsofOutput(t *testing.T) {
+	lsofOutput := []byte(`codex 12345 user 45w REG 254,1 654264 5176218 /home/user/.codex/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl
+`)
+
+	got := extractCodexSessionIDFromLsofOutput(lsofOutput)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromLsofOutput() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractCodexSessionIDFromLsofOutput_DockerStyleLine(t *testing.T) {
+	lsofOutput := []byte(`codex 44 root 36w REG 0,608 3392413 5176210 /root/.codex/sessions/2026/02/23/rollout-2026-02-23T18-37-01-019c8a12-e903-7670-bd12-709c6a4c5451.jsonl
+`)
+
+	got := extractCodexSessionIDFromLsofOutput(lsofOutput)
+	want := "019c8a12-e903-7670-bd12-709c6a4c5451"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromLsofOutput() docker line = %q, want %q", got, want)
+	}
+}
+
+func TestExtractCodexSessionIDFromPath_DeletedSuffix(t *testing.T) {
+	path := "/home/user/.codex/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl (deleted)"
+	got := extractCodexSessionIDFromPath(path)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromPath() = %q, want %q", got, want)
+	}
+}
+
+func TestParsePSParentChildMap(t *testing.T) {
+	procTable := []byte("100 1\n101 100\n102 100\n103 101\nbad-line\n104 invalid\n105 0\n")
+	got := parsePSParentChildMap(procTable)
+
+	want := map[int][]int{
+		1:   {100},
+		100: {101, 102},
+		101: {103},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsePSParentChildMap() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCollectProcessTreePIDsFromTable(t *testing.T) {
+	procTable := []byte("100 1\n101 100\n102 100\n103 101\n104 999\n")
+	got := collectProcessTreePIDsFromTable(100, procTable)
+	want := []int{100, 101, 102, 103}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectProcessTreePIDsFromTable() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexProbeMissingWarning(t *testing.T) {
+	if got := codexProbeMissingWarning(""); got != "" {
+		t.Fatalf("codexProbeMissingWarning(\"\") = %q, want empty", got)
+	}
+	want := "Codex session detection fallback: readlink is not available"
+	if got := codexProbeMissingWarning("readlink"); got != want {
+		t.Fatalf("codexProbeMissingWarning(\"readlink\") = %q, want %q", got, want)
+	}
+}
+
+func TestInstance_ConsumeCodexRestartWarning(t *testing.T) {
+	inst := NewInstanceWithTool("codex-warning", "/tmp/test", "codex")
+	inst.pendingCodexRestartWarning = "Codex session detection fallback: lsof is not available"
+
+	if got := inst.ConsumeCodexRestartWarning(); got == "" {
+		t.Fatalf("ConsumeCodexRestartWarning() returned empty warning")
+	}
+	if got := inst.ConsumeCodexRestartWarning(); got != "" {
+		t.Fatalf("second ConsumeCodexRestartWarning() = %q, want empty", got)
+	}
+}
+
+func TestInstance_ConsumeCodexRestartWarning_Concurrent(t *testing.T) {
+	inst := NewInstanceWithTool("codex-warning-concurrent", "/tmp/test", "codex")
+	inst.pendingCodexRestartWarning = "Codex session detection fallback: readlink is not available"
+
+	const workers = 16
+	var wg sync.WaitGroup
+	results := make(chan string, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- inst.ConsumeCodexRestartWarning()
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	nonEmpty := 0
+	for r := range results {
+		if r != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty != 1 {
+		t.Fatalf("non-empty warnings = %d, want 1", nonEmpty)
+	}
+}
+
 // TestInstance_UpdateHookStatus tests the UpdateHookStatus method.
 func TestInstance_UpdateHookStatus(t *testing.T) {
 	inst := NewInstanceWithTool("hook-update-test", "/tmp/test", "claude")
@@ -2467,6 +2602,98 @@ func TestInstance_UpdateHookStatus_Nil(t *testing.T) {
 	}
 }
 
+func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Claude(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	inst := NewInstanceWithTool("hook-anchor-claude", "/tmp/test", "claude")
+	WriteHookSessionAnchor(inst.ID, "anchor-claude-1")
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "",
+		Event:     "Stop",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.ClaudeSessionID != "anchor-claude-1" {
+		t.Fatalf("ClaudeSessionID = %q, want anchor-claude-1", inst.ClaudeSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Codex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	inst := NewInstanceWithTool("hook-anchor-codex", "/tmp/test", "codex")
+	WriteHookSessionAnchor(inst.ID, "anchor-codex-1")
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "",
+		Event:     "turn/completed",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.CodexSessionID != "anchor-codex-1" {
+		t.Fatalf("CodexSessionID = %q, want anchor-codex-1", inst.CodexSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_GeminiRejectsCandidateWithoutConversationData(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	inst := NewInstanceWithTool("hook-gemini-reject", "/tmp/test", "gemini")
+	inst.GeminiSessionID = "current-gemini-session"
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "candidate-no-data",
+		Event:     "AfterAgent",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.GeminiSessionID != "current-gemini-session" {
+		t.Fatalf("GeminiSessionID = %q, want current-gemini-session", inst.GeminiSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_GeminiAcceptsCandidateWithConversationData(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	projectPath := "/tmp/test-gemini-project"
+	inst := NewInstanceWithTool("hook-gemini-accept", projectPath, "gemini")
+	inst.GeminiSessionID = "current-gemini-session"
+
+	candidateID := "11111111-2222-3333-4444-555555555555"
+	sessionsDir := GetGeminiSessionsDir(projectPath)
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir sessions dir: %v", err)
+	}
+	filePath := filepath.Join(sessionsDir, "session-2026-03-05T10-00-"+candidateID[:8]+".json")
+	content := `{"sessionId":"` + candidateID + `","messages":[{"type":"user","content":"hi"}]}`
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: candidateID,
+		Event:     "AfterAgent",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.GeminiSessionID != candidateID {
+		t.Fatalf("GeminiSessionID = %q, want %q", inst.GeminiSessionID, candidateID)
+	}
+}
+
 func TestInstance_SetAcknowledgedFromShared_RunningIgnored(t *testing.T) {
 	inst := NewInstanceWithTool("ack-shared-running", "/tmp/test", "codex")
 	inst.Status = StatusRunning
@@ -2489,53 +2716,5 @@ func TestInstance_SetAcknowledgedFromShared_WaitingApplied(t *testing.T) {
 	}
 }
 
-func TestHasUnsentComposerPrompt(t *testing.T) {
-	content := "────────────────\n❯\u00a0Write one line: LAUNCH_OK\n[Opus 4.6] Context: 0%"
-	if !hasUnsentComposerPrompt(content, "Write one line: LAUNCH_OK") {
-		t.Fatal("expected unsent composer prompt to be detected")
-	}
-	if hasUnsentComposerPrompt(content, "Different text") {
-		t.Fatal("did not expect mismatched composer text to be detected")
-	}
-
-	// Submitted messages can appear in history; only current composer should count.
-	submitted := "❯ Write one line: LAUNCH_OK\n✳ Tempering…\n────────────────\n❯\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(submitted, "Write one line: LAUNCH_OK") {
-		t.Fatal("did not expect submitted history line to be treated as unsent composer input")
-	}
-
-	// Wrapped current composer lines only expose a prefix of the message.
-	wrappedContent := "────────────────\n❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep\n  under 80 lines and include one verdict line.\n────────────────\n[Opus 4.6] Context: 0%"
-	wrappedMessage := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if !hasUnsentComposerPrompt(wrappedContent, wrappedMessage) {
-		t.Fatal("expected wrapped unsent composer prompt to be detected")
-	}
-
-	// Claude hint suggestions should not be treated as unsent input for a
-	// different message.
-	suggestion := "────────────────\n❯\u00a0Try \"write a test for <filepath>\"\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(suggestion, wrappedMessage) {
-		t.Fatal("did not expect suggestion placeholder to be treated as unsent composer input")
-	}
-}
-
-func TestCurrentComposerPrompt_UsesBottomComposerBlock(t *testing.T) {
-	content := strings.Join([]string{
-		"> quoted output line from earlier response",
-		"Some other output",
-		"────────────────",
-		"❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep",
-		"  under 80 lines and include one verdict line.",
-		"────────────────",
-		"[Opus 4.6] Context: 0%",
-	}, "\n")
-
-	got, ok := currentComposerPrompt(content)
-	if !ok {
-		t.Fatal("expected current composer prompt to be found")
-	}
-	want := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if got != want {
-		t.Fatalf("unexpected composer prompt.\nwant: %q\ngot:  %q", want, got)
-	}
-}
+// Tests for hasUnsentComposerPrompt and currentComposerPrompt moved to
+// internal/send/send_test.go as part of send verification consolidation.

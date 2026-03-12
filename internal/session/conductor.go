@@ -32,6 +32,9 @@ type ConductorSettings struct {
 
 	// Slack defines Slack bot integration settings
 	Slack SlackSettings `toml:"slack"`
+
+	// Discord defines Discord bot integration settings
+	Discord DiscordSettings `toml:"discord"`
 }
 
 // TelegramSettings defines Telegram bot configuration for the conductor bridge
@@ -62,6 +65,21 @@ type SlackSettings struct {
 	// If empty, all users are allowed (backward compatible).
 	// Get user ID from Slack: Right-click user → View profile → More → Copy member ID
 	AllowedUserIDs []string `toml:"allowed_user_ids"`
+}
+
+// DiscordSettings defines Discord bot configuration for the conductor bridge
+type DiscordSettings struct {
+	// BotToken is the Discord bot token from the Developer Portal
+	BotToken string `toml:"bot_token"`
+
+	// GuildID is the Discord server (guild) where the bot operates
+	GuildID int64 `toml:"guild_id"`
+
+	// ChannelID is the Discord channel where the bot listens and posts
+	ChannelID int64 `toml:"channel_id"`
+
+	// UserID is the authorized Discord user ID
+	UserID int64 `toml:"user_id"`
 }
 
 // ConductorMeta holds metadata for a named conductor instance
@@ -113,10 +131,16 @@ func (i *Instance) ConductorClearOnCompact() bool {
 // conductorNameRegex validates conductor names: starts with alphanumeric, then alphanumeric/._-
 var conductorNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// GetHeartbeatInterval returns the heartbeat interval, defaulting to 15 minutes
+// GetHeartbeatInterval returns the heartbeat interval in minutes.
+// Returns 0 when HeartbeatInterval is 0 (explicitly disabled).
+// Returns 15 (default) when HeartbeatInterval is negative.
+// Returns the configured value when HeartbeatInterval is positive.
 func (c *ConductorSettings) GetHeartbeatInterval() int {
-	if c.HeartbeatInterval <= 0 {
-		return 15
+	if c.HeartbeatInterval == 0 {
+		return 0 // explicitly disabled
+	}
+	if c.HeartbeatInterval < 0 {
+		return 15 // negative = use default
 	}
 	return c.HeartbeatInterval
 }
@@ -588,11 +612,17 @@ const conductorHeartbeatScript = `#!/bin/bash
 SESSION="conductor-{NAME}"
 PROFILE="{PROFILE}"
 
+# Check if conductor is enabled
+ENABLED=$(agent-deck -p "$PROFILE" conductor status --json 2>/dev/null | tr -d '\n' | sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')
+if [ "$ENABLED" != "true" ]; then
+    exit 0
+fi
+
 # Only send if the session is running
 STATUS=$(agent-deck -p "$PROFILE" session show "$SESSION" --json 2>/dev/null | tr -d '\n' | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
 if [ "$STATUS" = "idle" ] || [ "$STATUS" = "waiting" ]; then
-    agent-deck -p "$PROFILE" session send "$SESSION" "Heartbeat: Check all sessions in the {PROFILE} profile. List any waiting sessions, auto-respond where safe, and report what needs my attention." --no-wait -q
+    agent-deck -p "$PROFILE" session send "$SESSION" "Heartbeat: Check sessions in your group ({NAME}). List any that are waiting, auto-respond where safe, and report what needs my attention." --no-wait -q
 fi
 `
 

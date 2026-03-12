@@ -48,9 +48,12 @@ type jsonInstanceData struct {
 	CodexSessionID  string    `json:"codex_session_id,omitempty"`
 	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
 
-	LatestPrompt    string          `json:"latest_prompt,omitempty"`
-	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
-	LoadedMCPNames  []string        `json:"loaded_mcp_names,omitempty"`
+	LatestPrompt     string          `json:"latest_prompt,omitempty"`
+	Notes            string          `json:"notes,omitempty"`
+	ToolOptionsJSON  json.RawMessage `json:"tool_options,omitempty"`
+	LoadedMCPNames   []string        `json:"loaded_mcp_names,omitempty"`
+	Sandbox          json.RawMessage `json:"sandbox,omitempty"`
+	SandboxContainer string          `json:"sandbox_container,omitempty"`
 }
 
 // jsonGroupData mirrors session.GroupData for migration.
@@ -75,8 +78,11 @@ type toolDataBlob struct {
 	CodexSessionID     string          `json:"codex_session_id,omitempty"`
 	CodexDetectedAt    int64           `json:"codex_detected_at,omitempty"`
 	LatestPrompt       string          `json:"latest_prompt,omitempty"`
+	Notes              string          `json:"notes,omitempty"`
 	LoadedMCPNames     []string        `json:"loaded_mcp_names,omitempty"`
 	ToolOptions        json.RawMessage `json:"tool_options,omitempty"`
+	Sandbox            json.RawMessage `json:"sandbox,omitempty"`
+	SandboxContainer   string          `json:"sandbox_container,omitempty"`
 	SSHHost            string          `json:"ssh_host,omitempty"`
 	SSHRemotePath      string          `json:"ssh_remote_path,omitempty"`
 }
@@ -105,8 +111,11 @@ func MigrateFromJSON(jsonPath string, db *StateDB) (int, int, error) {
 			OpenCodeSessionID: inst.OpenCodeSessionID,
 			CodexSessionID:    inst.CodexSessionID,
 			LatestPrompt:      inst.LatestPrompt,
+			Notes:             inst.Notes,
 			LoadedMCPNames:    inst.LoadedMCPNames,
 			ToolOptions:       inst.ToolOptionsJSON,
+			Sandbox:           inst.Sandbox,
+			SandboxContainer:  inst.SandboxContainer,
 		}
 		if !inst.ClaudeDetectedAt.IsZero() {
 			td.ClaudeDetectedAt = inst.ClaudeDetectedAt.Unix()
@@ -180,8 +189,9 @@ func MarshalToolData(
 	geminiYoloMode *bool, geminiModel string,
 	openCodeSessionID string, openCodeDetectedAt time.Time,
 	codexSessionID string, codexDetectedAt time.Time,
-	latestPrompt string, loadedMCPNames []string,
+	latestPrompt string, notes string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
+	sandboxJSON json.RawMessage, sandboxContainer string,
 	sshHost string, sshRemotePath string,
 ) json.RawMessage {
 	td := toolDataBlob{
@@ -192,8 +202,11 @@ func MarshalToolData(
 		OpenCodeSessionID: openCodeSessionID,
 		CodexSessionID:    codexSessionID,
 		LatestPrompt:      latestPrompt,
+		Notes:             notes,
 		LoadedMCPNames:    loadedMCPNames,
 		ToolOptions:       toolOptionsJSON,
+		Sandbox:           sandboxJSON,
+		SandboxContainer:  sandboxContainer,
 		SSHHost:           sshHost,
 		SSHRemotePath:     sshRemotePath,
 	}
@@ -221,8 +234,9 @@ func UnmarshalToolData(data json.RawMessage) (
 	geminiYoloMode *bool, geminiModel string,
 	openCodeSessionID string, openCodeDetectedAt time.Time,
 	codexSessionID string, codexDetectedAt time.Time,
-	latestPrompt string, loadedMCPNames []string,
+	latestPrompt string, notes string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
+	sandboxJSON json.RawMessage, sandboxContainer string,
 	sshHost string, sshRemotePath string,
 ) {
 	if len(data) == 0 {
@@ -251,8 +265,11 @@ func UnmarshalToolData(data json.RawMessage) (
 		codexDetectedAt = time.Unix(td.CodexDetectedAt, 0)
 	}
 	latestPrompt = td.LatestPrompt
+	notes = td.Notes
 	loadedMCPNames = td.LoadedMCPNames
 	toolOptionsJSON = td.ToolOptions
+	sandboxJSON = td.Sandbox
+	sandboxContainer = td.SandboxContainer
 	sshHost = td.SSHHost
 	sshRemotePath = td.SSHRemotePath
 	return

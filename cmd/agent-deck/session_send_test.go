@@ -98,6 +98,45 @@ func TestWaitForCompletion_TransientErrors(t *testing.T) {
 	}
 }
 
+func TestWaitForCompletion_SessionDeath(t *testing.T) {
+	// When GetStatus returns 5+ consecutive errors, the session is dead.
+	// waitForCompletion should return ("error", nil) instead of hanging.
+	mock := &mockStatusChecker{
+		statuses: []string{"", "", "", "", "", "", ""},
+		errors: []error{
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+		},
+	}
+	status, err := waitForCompletion(mock, 10*time.Second)
+	if err != nil {
+		t.Fatalf("expected nil error (session death detection), got: %v", err)
+	}
+	if status != "error" {
+		t.Errorf("expected status 'error' for session death, got %q", status)
+	}
+}
+
+func TestWaitForCompletion_TransientRecovery(t *testing.T) {
+	// Fewer than 5 consecutive errors should recover when a valid status follows.
+	mock := &mockStatusChecker{
+		statuses: []string{"", "", "", "waiting"},
+		errors:   []error{fmt.Errorf("tmux error"), fmt.Errorf("tmux error"), fmt.Errorf("tmux error"), nil},
+	}
+	status, err := waitForCompletion(mock, 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != "waiting" {
+		t.Errorf("expected status 'waiting' after transient recovery, got %q", status)
+	}
+}
+
 func TestWaitForCompletion_Timeout(t *testing.T) {
 	mock := &mockStatusChecker{
 		statuses: []string{"active"}, // Stays active forever
@@ -163,66 +202,6 @@ func (m *mockSendRetryTarget) CapturePaneFresh() (string, error) {
 	return m.panes[i], err
 }
 
-func TestHasUnsentPastedPrompt(t *testing.T) {
-	if !hasUnsentPastedPrompt("❯ [Pasted text #1 +89 lines]") {
-		t.Fatal("expected pasted prompt marker to be detected")
-	}
-	if hasUnsentPastedPrompt("normal terminal output") {
-		t.Fatal("did not expect normal output to be detected as pasted prompt")
-	}
-}
-
-func TestHasUnsentComposerPrompt(t *testing.T) {
-	content := "────────────────\n❯\u00a0Write one line: LAUNCH_OK\n[Opus 4.6] Context: 0%"
-	if !hasUnsentComposerPrompt(content, "Write one line: LAUNCH_OK") {
-		t.Fatal("expected unsent composer prompt to be detected")
-	}
-	if hasUnsentComposerPrompt(content, "Different text") {
-		t.Fatal("did not expect mismatched composer text to be detected")
-	}
-
-	// Submitted messages can appear in history; only current composer should count.
-	submitted := "❯ Write one line: LAUNCH_OK\n✳ Tempering…\n────────────────\n❯\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(submitted, "Write one line: LAUNCH_OK") {
-		t.Fatal("did not expect submitted history line to be treated as unsent composer input")
-	}
-
-	// Wrapped current composer lines only expose a prefix of the message.
-	wrappedContent := "────────────────\n❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep\n  under 80 lines and include one verdict line.\n────────────────\n[Opus 4.6] Context: 0%"
-	wrappedMessage := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if !hasUnsentComposerPrompt(wrappedContent, wrappedMessage) {
-		t.Fatal("expected wrapped unsent composer prompt to be detected")
-	}
-
-	// Claude hint suggestions should not be treated as unsent input for a
-	// different message.
-	suggestion := "────────────────\n❯\u00a0Try \"write a test for <filepath>\"\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(suggestion, wrappedMessage) {
-		t.Fatal("did not expect suggestion placeholder to be treated as unsent composer input")
-	}
-}
-
-func TestCurrentComposerPrompt_UsesBottomComposerBlock(t *testing.T) {
-	content := strings.Join([]string{
-		"> quoted output line from earlier response",
-		"Some other output",
-		"────────────────",
-		"❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep",
-		"  under 80 lines and include one verdict line.",
-		"────────────────",
-		"[Opus 4.6] Context: 0%",
-	}, "\n")
-
-	got, ok := currentComposerPrompt(content)
-	if !ok {
-		t.Fatal("expected current composer prompt to be found")
-	}
-	want := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if got != want {
-		t.Fatalf("unexpected composer prompt.\nwant: %q\ngot:  %q", want, got)
-	}
-}
-
 func TestSendWithRetryTarget_SkipVerify(t *testing.T) {
 	mock := &mockSendRetryTarget{
 		statuses: []string{"waiting"},
@@ -260,8 +239,9 @@ func TestSendWithRetryTarget_WaitingWithoutPasteMarkerReturnsSuccess(t *testing.
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
-		t.Fatalf("expected 1 periodic fallback SendEnter call for waiting-without-active state, got %d", got)
+	// With aggressive early retry (retry < 5), all 4 iterations nudge Enter.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 4 {
+		t.Fatalf("expected 4 aggressive early SendEnter calls for waiting-without-active state, got %d", got)
 	}
 }
 
@@ -298,8 +278,10 @@ func TestSendWithRetryTarget_DetectsPasteMarkerAfterInitialWaiting(t *testing.T)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
-		t.Fatalf("expected 1 SendEnter call when pasted marker appears after initial waiting, got %d", got)
+	// 2 calls: retry 0 fires early aggressive nudge (waiting, no active seen),
+	// retry 1 fires from paste marker detection.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 2 {
+		t.Fatalf("expected 2 SendEnter calls (1 early nudge + 1 paste marker), got %d", got)
 	}
 }
 
@@ -347,8 +329,9 @@ func TestSendWithRetryTarget_AmbiguousStateUsesLimitedFallbackRetries(t *testing
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 2 {
-		t.Fatalf("expected 2 limited fallback SendEnter calls, got %d", got)
+	// Ambiguous-state Enter budget increased from 2 to 4; all 4 retries send Enter.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 4 {
+		t.Fatalf("expected 4 fallback SendEnter calls (increased budget), got %d", got)
 	}
 }
 
@@ -364,6 +347,52 @@ func TestSendWithRetryTarget_ReturnsErrorWhenInitialSendFails(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
+
+func TestSendWithRetryTarget_AggressiveEarlyEnterNudge(t *testing.T) {
+	// Verify that SendEnter is called on every iteration for the first 5
+	// retries when in waiting-without-active state, then every 2nd iteration.
+	mock := &mockSendRetryTarget{
+		statuses: []string{
+			"waiting", "waiting", "waiting", "waiting", "waiting", // retries 0-4: all nudge
+			"waiting", "waiting", "waiting", "waiting", "waiting", // retries 5-9: even nudge
+		},
+		panes: []string{"", "", "", "", "", "", "", "", "", ""},
+	}
+	err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{maxRetries: 10, checkDelay: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// First 5 retries (0-4): all nudge = 5 calls
+	// Retries 5-9: retry%2==0 means retries 6, 8 nudge = 2 calls
+	// Total: 5 + 2 = 7
+	// But wait: retry 5 is not < 5 and 5%2 != 0, so no nudge.
+	// retry 6: 6%2 == 0, nudge. retry 7: no. retry 8: nudge. retry 9: no.
+	// Total: 5 (early) + 2 (even from 5-9) = 7
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 7 {
+		t.Fatalf("expected 7 SendEnter calls (5 early + 2 even), got %d", got)
+	}
+}
+
+func TestSendWithRetryTarget_IncreasedAmbiguousBudget(t *testing.T) {
+	// Verify that ambiguous-state Enter budget is 4 (up from 2).
+	mock := &mockSendRetryTarget{
+		statuses: []string{"error", "error", "error", "error", "error"},
+		panes:    []string{"", "", "", "", ""},
+	}
+	err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{maxRetries: 5, checkDelay: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Retries 0, 1, 2, 3 are < 4 so SendEnter is called 4 times; retry 4 is not.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 4 {
+		t.Fatalf("expected 4 SendEnter calls for increased ambiguous budget, got %d", got)
+	}
+}
+
+// Integration test coverage for Codex readiness: waitForAgentReady uses a
+// concrete *tmux.Session so it cannot be unit tested with mocks here.
+// See TestSend_CodexReadiness in internal/integration/send_reliability_test.go
+// (Plan 02) for integration test coverage of Codex prompt gating.
 
 // TestWaitOutputRetrieval_StaleSessionID verifies that --wait correctly
 // retrieves output even when the initially-loaded ClaudeSessionID is stale.

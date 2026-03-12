@@ -190,6 +190,7 @@ const (
 	IconGemini   = "✨"
 	IconOpenCode = "🌐"
 	IconCodex    = "💻"
+	IconPi       = "π"
 	IconShell    = "🐚"
 )
 
@@ -238,6 +239,7 @@ var (
 	SessionStatusWaiting  lipgloss.Style
 	SessionStatusIdle     lipgloss.Style
 	SessionStatusError    lipgloss.Style
+	SessionStatusStopped  lipgloss.Style
 	SessionStatusSelStyle lipgloss.Style
 
 	// Session title styles by state
@@ -489,6 +491,7 @@ func initStyles() {
 	SessionStatusWaiting = lipgloss.NewStyle().Foreground(ColorYellow)
 	SessionStatusIdle = lipgloss.NewStyle().Foreground(ColorTextDim)
 	SessionStatusError = lipgloss.NewStyle().Foreground(ColorRed)
+	SessionStatusStopped = lipgloss.NewStyle().Foreground(ColorTextDim)
 	SessionStatusSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
 
 	// Session title styles by state
@@ -518,6 +521,7 @@ func initStyles() {
 		"claude":   lipgloss.NewStyle().Foreground(ColorOrange),
 		"gemini":   lipgloss.NewStyle().Foreground(ColorPurple),
 		"codex":    lipgloss.NewStyle().Foreground(ColorCyan),
+		"pi":       lipgloss.NewStyle().Foreground(ColorAccent),
 		"aider":    lipgloss.NewStyle().Foreground(ColorRed),
 		"cursor":   lipgloss.NewStyle().Foreground(ColorAccent),
 		"shell":    lipgloss.NewStyle().Foreground(ColorText),
@@ -595,6 +599,8 @@ func ToolIcon(tool string) string {
 		return IconOpenCode
 	case "codex":
 		return IconCodex
+	case "pi":
+		return IconPi
 	case "cursor":
 		return "📝"
 	case "shell":
@@ -605,7 +611,7 @@ func ToolIcon(tool string) string {
 }
 
 // ToolColor returns the brand color for a given tool
-// Claude=orange (Anthropic), Gemini=purple (Google AI), Codex=cyan, Aider=red
+// Claude=orange (Anthropic), Gemini=purple (Google AI), Codex=cyan, Pi=accent, Aider=red
 func ToolColor(tool string) lipgloss.Color {
 	switch tool {
 	case "claude":
@@ -614,6 +620,8 @@ func ToolColor(tool string) lipgloss.Color {
 		return ColorPurple // Google AI purple
 	case "codex":
 		return ColorCyan // Light blue for OpenAI
+	case "pi":
+		return ColorAccent
 	case "aider":
 		return ColorRed // Red for Aider
 	case "cursor":
