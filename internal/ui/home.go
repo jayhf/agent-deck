@@ -1772,20 +1772,19 @@ func (h *Home) startBulkPRRefresh() {
 				ch <- result{sid: t.sid, info: info}
 			}(t)
 		}
-		results := make(map[string]*ghub.PRInfo, len(targets))
 		hasPending := false
-		for range targets {
-			r := <-ch
-			results[r.sid] = r.info
-			if r.info != nil && r.info.Status == ghub.CheckPending {
-				hasPending = true
-			}
-		}
 		h.prInfoMu.Lock()
 		now := time.Now()
-		for sid, info := range results {
-			h.prInfoCache[sid] = info
-			h.prInfoCacheTs[sid] = now
+		for range targets {
+			r := <-ch
+			if r.info != nil {
+				h.prInfoCache[r.sid] = r.info
+				h.prInfoCacheTs[r.sid] = now
+				if r.info.Status == ghub.CheckPending {
+					hasPending = true
+				}
+			}
+			// On failure (nil info), keep the previous cached value
 		}
 		h.prHasPending = hasPending
 		h.prInfoMu.Unlock()
