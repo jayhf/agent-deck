@@ -147,9 +147,11 @@ type Instance struct {
 	tmuxSession *tmux.Session // Internal tmux session
 
 	// Hook-based status detection (set by StatusFileWatcher from Claude Code hooks)
-	hookStatus     string    // running, idle, waiting, dead (empty = no hook data)
-	hookSessionID  string    // Session ID from hook payload
-	hookLastUpdate time.Time // When hook status was last received
+	hookStatus              string    // running, idle, waiting, dead (empty = no hook data)
+	hookEvent               string    // event name from last hook (e.g., "PermissionRequest")
+	hookSessionID           string    // Session ID from hook payload
+	hookLastUpdate          time.Time // When hook status was last received
+	permissionAnsweredAt    time.Time // When a permission was answered via y/n from main view
 
 	// mu protects fields written by backgroundStatusUpdate and read by the TUI goroutine.
 	// Use GetStatus()/SetStatus() and GetTool()/SetTool() for thread-safe access.
@@ -2650,6 +2652,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	defer i.mu.Unlock()
 
 	i.hookStatus = status.Status
+	i.hookEvent = status.Event
 	i.hookLastUpdate = status.UpdatedAt
 
 	// Resolve session ID from hook payload first, then sidecar anchor.
@@ -2741,7 +2744,31 @@ func (i *Instance) ClearHookStatus() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.hookStatus = ""
+	i.hookEvent = ""
 	i.hookLastUpdate = time.Time{}
+}
+
+// IsWaitingForPermission returns true if the instance is blocked on a Claude
+// permission prompt (PermissionRequest or Notification with permission_prompt matcher).
+func (i *Instance) IsWaitingForPermission() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	// Grace period after user answered a permission prompt from the main view.
+	// The hook status file on disk still has the old PermissionRequest until
+	// Claude processes the key and fires a new event.
+	if !i.permissionAnsweredAt.IsZero() && time.Since(i.permissionAnsweredAt) < 5*time.Second {
+		return false
+	}
+	return i.hookStatus == "waiting" &&
+		(i.hookEvent == "PermissionRequest" || i.hookEvent == "Notification")
+}
+
+// MarkPermissionAnswered records that the user answered a permission prompt
+// from the main view, suppressing IsWaitingForPermission() for a grace period.
+func (i *Instance) MarkPermissionAnswered() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.permissionAnsweredAt = time.Now()
 }
 
 // ForceNextStatusCheck clears the idle polling optimization so the next
