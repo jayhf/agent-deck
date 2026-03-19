@@ -449,6 +449,9 @@ func TestGetWorktreeSettings(t *testing.T) {
 	if !settings.AutoCleanup {
 		t.Error("GetWorktreeSettings AutoCleanup: should default to true")
 	}
+	if got := settings.Prefix(); got != "feature/" {
+		t.Errorf("GetWorktreeSettings Prefix(): got %q, want %q", got, "feature/")
+	}
 }
 
 func TestGetWorktreeSettings_FromConfig(t *testing.T) {
@@ -476,6 +479,35 @@ func TestGetWorktreeSettings_FromConfig(t *testing.T) {
 	}
 	if settings.AutoCleanup {
 		t.Error("GetWorktreeSettings AutoCleanup: should be false from config")
+	}
+	// BranchPrefix should default to "feature/" when not set in config
+	if got := settings.Prefix(); got != "feature/" {
+		t.Errorf("GetWorktreeSettings Prefix(): got %q, want %q", got, "feature/")
+	}
+}
+
+func TestGetWorktreeSettings_CustomBranchPrefix(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+	config := &UserConfig{
+		Worktree: WorktreeSettings{
+			DefaultLocation: "subdirectory",
+			BranchPrefix:    strPtr("fix/"),
+		},
+	}
+	_ = SaveUserConfig(config)
+	ClearUserConfigCache()
+
+	settings := GetWorktreeSettings()
+	if got := settings.Prefix(); got != "fix/" {
+		t.Errorf("GetWorktreeSettings Prefix(): got %q, want %q", got, "fix/")
 	}
 }
 
