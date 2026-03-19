@@ -1772,11 +1772,16 @@ func (h *Home) startBulkPRRefresh() {
 				ch <- result{sid: t.sid, info: info}
 			}(t)
 		}
+		// Collect all results BEFORE acquiring the lock to avoid blocking
+		// the UI render loop while waiting for slow gh commands.
+		results := make([]result, 0, len(targets))
+		for range targets {
+			results = append(results, <-ch)
+		}
 		hasPending := false
 		h.prInfoMu.Lock()
 		now := time.Now()
-		for range targets {
-			r := <-ch
+		for _, r := range results {
 			if r.info != nil {
 				h.prInfoCache[r.sid] = r.info
 				h.prInfoCacheTs[r.sid] = now
