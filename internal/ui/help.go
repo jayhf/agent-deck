@@ -262,6 +262,7 @@ func (h *HelpOverlay) View() string {
 				{editPathsKey, "Edit multi-repo paths"},
 				{editSessionKey, "Edit session settings (title/color/...)"},
 				{notesKey, "Edit notes"},
+				{h.key(hotkeyOpenEditor, "o"), "Open in VS Code"},
 			},
 		},
 		{
