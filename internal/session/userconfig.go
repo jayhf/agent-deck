@@ -1131,6 +1131,9 @@ func (w *WorktreeSettings) Prefix() string {
 	if w.BranchPrefix == nil {
 		return "feature/"
 	}
+	if *w.BranchPrefix == "none" {
+		return ""
+	}
 	return os.ExpandEnv(*w.BranchPrefix)
 }
 
