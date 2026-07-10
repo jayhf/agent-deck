@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.31" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.10.9" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -58,6 +57,8 @@ func init() {
 func initUpdateSettings() {
 	settings := session.GetUpdateSettings()
 	update.SetCheckInterval(settings.CheckIntervalHours)
+	update.SetBridgeScriptInstaller(session.InstallBridgeScript)
+	update.SetConductorDirResolver(session.ConductorDir)
 }
 
 // writeVersionOutput prints `Agent Deck vX.Y.Z` to `w`, appending
@@ -76,7 +77,7 @@ func writeVersionOutput(w io.Writer, currentVersion string) {
 // Uses cache to avoid API calls - only prints if update was already detected
 func printUpdateNotice() {
 	settings := session.GetUpdateSettings()
-	if !settings.CheckEnabled || !settings.NotifyInCLI {
+	if !settings.GetCheckEnabled() || !settings.GetNotifyInCLI() {
 		return
 	}
 
@@ -93,7 +94,7 @@ func printUpdateNotice() {
 // promptForUpdate checks for updates and prompts user if auto_update is enabled
 func promptForUpdate() bool {
 	settings := session.GetUpdateSettings()
-	if !settings.CheckEnabled {
+	if !settings.GetCheckEnabled() {
 		return false
 	}
 
@@ -124,7 +125,12 @@ func promptForUpdate() bool {
 	}
 
 	fmt.Println()
-	if err := update.PerformUpdate(info.DownloadURL); err != nil {
+	release, err := update.FetchReleaseByTag(info.LatestVersion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Update failed: failed to fetch release info: %v\n", err)
+		return false
+	}
+	if err := update.PerformVerifiedUpdate(release, runtime.GOOS, runtime.GOARCH); err != nil {
 		fmt.Fprintf(os.Stderr, "Update failed: %v\n", err)
 		return false
 	}
@@ -320,6 +326,9 @@ func main() {
 		case "uninstall":
 			handleUninstall(args[1:])
 			return
+		case "migrate-paths":
+			handleMigratePaths(args[1:])
+			return
 		case "hook-handler":
 			handleHookHandler()
 			return
@@ -335,14 +344,26 @@ func main() {
 		case "gemini-hooks":
 			handleGeminiHooks(args[1:])
 			return
+		case "hermes-hooks":
+			handleHermesHooks(args[1:])
+			return
+		case "cursor-hooks":
+			handleCursorHooks(args[1:])
+			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "run-task":
+			handleRunTask(args[1:])
 			return
 		case "inbox":
 			handleInbox(args[1:])
 			return
 		case "feedback":
 			handleFeedback(args[1:])
+			return
+		case "creds-refresh":
+			handleCredsRefresh(args[1:])
 			return
 		case "debug-dump":
 			handleDebugDump()
@@ -440,9 +461,13 @@ func main() {
 		}
 	}
 
-	// Check if multiple instances are allowed (uses primary election as single-instance gate)
+	// Check if multiple instances are allowed (uses primary election as single-instance gate).
+	// In headless web mode (--no-tui), skip the gate — a headless HTTP server is meant to
+	// coexist with an interactive TUI for the same profile (the whole point of --no-tui), and
+	// the sibling TUI-launch guards above skip the same way. Without this, restarting the web
+	// daemon while a TUI holds the profile primary makes it lose ElectPrimary and exit.
 	instanceSettings := session.GetInstanceSettings()
-	if !instanceSettings.GetAllowMultiple() {
+	if !webHeadless && !instanceSettings.GetAllowMultiple() {
 		if db := statedb.GetGlobal(); db != nil {
 			isFirst, electErr := db.ElectPrimary(30 * time.Second)
 			if electErr == nil && !isFirst {
@@ -453,11 +478,24 @@ func main() {
 		}
 	}
 
-	// Set up signal handling for graceful shutdown and crash dumps
+	// Set up signal handling for graceful shutdown and crash dumps.
+	// SIGHUP is included so closing the terminal window/tab also runs cleanup;
+	// without it the default action is an abrupt terminate that leaks every
+	// `tmux -C attach-session` control client (they reparent to launchd and
+	// pile up against the single-threaded tmux server).
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigChan
+		// Close control-mode pipes so their tmux clients detach cleanly instead
+		// of orphaning. PipeManager.Close drives the staged EOF teardown, which
+		// avoids the signal-driven detach that races tmux/tmux#4980. The clean
+		// in-app quit path already does this via performFinalShutdown; the
+		// signal path must too, or the clients leak (killStaleControlClients
+		// only sweeps them up on a later Connect).
+		if pm := tmux.GetPipeManager(); pm != nil {
+			pm.Close()
+		}
 		if db := statedb.GetGlobal(); db != nil {
 			_ = db.ResignPrimary()
 			_ = db.UnregisterInstance()
@@ -466,13 +504,13 @@ func main() {
 	}()
 
 	// Set up structured logging (JSONL format with rotation)
-	// When AGENTDECK_DEBUG is set, logs go to ~/.agent-deck/debug.log
+	// When AGENTDECK_DEBUG is set, logs go to the XDG cache debug.log.
 	// When not set, logs are discarded to avoid TUI interference
 	debugMode := os.Getenv("AGENTDECK_DEBUG") != ""
-	if baseDir, err := session.GetAgentDeckDir(); err == nil {
+	if cacheDir, err := ensureEffectiveCacheDir(); err == nil {
 		logCfg := logging.Config{
 			Debug:                 debugMode,
-			LogDir:                baseDir,
+			LogDir:                cacheDir,
 			Level:                 "debug",
 			Format:                "json",
 			MaxSizeMB:             10,
@@ -501,9 +539,7 @@ func main() {
 			if ls.DebugRetentionDays > 0 {
 				logCfg.MaxAgeDays = ls.DebugRetentionDays
 			}
-			if ls.DebugCompress {
-				logCfg.Compress = ls.DebugCompress
-			}
+			logCfg.Compress = ls.GetDebugCompress()
 			if ls.RingBufferMB > 0 {
 				logCfg.RingBufferSize = ls.RingBufferMB * 1024 * 1024
 			}
@@ -519,7 +555,7 @@ func main() {
 		defer logging.Shutdown()
 
 		// OBS-01: emit the cgroup-isolation decision exactly once on TUI
-		// startup. The line lands in ~/.agent-deck/debug.log via the
+		// startup. The line lands in the XDG cache debug.log via the
 		// dynamicHandler + lumberjack pipeline that logging.Init wires up.
 		// See internal/session/userconfig.go LogCgroupIsolationDecision.
 		session.LogCgroupIsolationDecision()
@@ -534,7 +570,7 @@ func main() {
 		signal.Notify(usr1Chan, syscall.SIGUSR1)
 		go func() {
 			for range usr1Chan {
-				dumpPath := filepath.Join(baseDir, fmt.Sprintf("crash-dump-%d.jsonl", time.Now().Unix()))
+				dumpPath := filepath.Join(cacheDir, fmt.Sprintf("crash-dump-%d.jsonl", time.Now().Unix()))
 				if err := logging.DumpRingBuffer(dumpPath); err != nil {
 					logging.ForComponent(logging.CompUI).Error("crash_dump_failed",
 						slog.String("error", err.Error()))
@@ -632,9 +668,14 @@ func main() {
 		userCfg, _ := session.LoadUserConfig()
 
 		// Set up pricer with overrides
-		homeDir, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(homeDir, ".agent-deck")
-		pricerCfg := costs.PricerConfig{CachePath: cacheDir}
+		cacheDir, cacheErr := effectiveCacheDir()
+		if cacheErr != nil {
+			cacheDir = ""
+		}
+		pricerCfg := costs.PricerConfig{}
+		if cacheDir != "" {
+			pricerCfg.CachePath = cacheDir
+		}
 		if userCfg != nil && len(userCfg.Costs.Pricing.Overrides) > 0 {
 			pricerCfg.Overrides = make(map[string]costs.PriceOverride)
 			for model, ov := range userCfg.Costs.Pricing.Overrides {
@@ -647,13 +688,15 @@ func main() {
 			}
 		}
 		pricer := costs.NewPricer(pricerCfg)
-		_ = pricer.LoadCache()
+		if cacheDir != "" {
+			_ = pricer.LoadCache()
 
-		// Start daily price fetcher
-		fetchCtx, fetchCancel := context.WithCancel(context.Background())
-		defer fetchCancel()
-		fetcher := &costs.Fetcher{CachePath: filepath.Join(cacheDir, "pricing.json"), Pricer: pricer}
-		go fetcher.StartDaily(fetchCtx)
+			// Start daily price fetcher
+			fetchCtx, fetchCancel := context.WithCancel(context.Background())
+			defer fetchCancel()
+			fetcher := &costs.Fetcher{CachePath: filepath.Join(cacheDir, "pricing.json"), Pricer: pricer}
+			go fetcher.StartDaily(fetchCtx)
+		}
 
 		// Set up budget checker
 		var budgetCfg costs.BudgetConfig
@@ -677,7 +720,7 @@ func main() {
 		homeModel.SetCostBudget(budgetChecker)
 
 		// Start cost event watcher (for Claude hook events)
-		costEventsDir := filepath.Join(homeDir, ".agent-deck", "cost-events")
+		costEventsDir := getCostEventsDir()
 		costWatcher, watchErr := costs.NewCostEventWatcher(costEventsDir)
 		if watchErr == nil {
 			go costWatcher.Start()
@@ -719,6 +762,15 @@ func main() {
 		fallbackMenuData := web.NewSessionDataService(effectiveProfile)
 		liveMenuData := web.NewMemoryMenuData(fallbackMenuData)
 		homeModel.SetWebMenuData(liveMenuData)
+
+		// #1397: in headless mode no bubbletea loop ever populates the Home's
+		// in-memory registry, so the WebMutator must hydrate it from storage on
+		// each mutation. Flag the model so WebMutator.ensureHydrated activates;
+		// otherwise delete/restart/close/group-mutate on pre-existing sessions
+		// fail ("session not found" / empty-sweep guard).
+		if webHeadless {
+			homeModel.SetHeadless(true)
+		}
 
 		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData, ui.NewWebMutator(homeModel))
 		if err != nil {
@@ -809,13 +861,48 @@ func main() {
 	}
 }
 
-// extractProfileFlag extracts -p or --profile from args, returning the profile and remaining args
+// globalFlagSubcommands lists every token that main()'s dispatch switch treats
+// as a subcommand. extractProfileFlag stops honoring the global -p/--profile
+// flag once it reaches one of these, so a subcommand that defines its own -p
+// (launch/add --parent, group move --position) is not shadowed by the global
+// profile flag. KEEP IN SYNC with the switch in main().
+var globalFlagSubcommands = map[string]bool{
+	"add": true, "list": true, "ls": true, "remove": true, "rm": true,
+	"rename": true, "mv": true, "status": true, "profile": true, "update": true,
+	"session": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
+	"group": true, "try": true, "launch": true, "conductor": true,
+	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
+	"remote": true, "worktree": true, "wt": true, "costs": true, "web": true,
+	"uninstall": true, "migrate-paths": true, "hook-handler": true,
+	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
+	"hermes-hooks": true, "cursor-hooks": true, "notify-daemon": true,
+	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true,
+	"debug-dump": true, "version": true, "help": true,
+}
+
+// extractProfileFlag extracts the global -p or --profile flag from args,
+// returning the profile and remaining args.
+//
+// The global flag is only honored BEFORE the subcommand token. Without this
+// boundary, `agent-deck launch . -p <parent>` had its -p swallowed here as a
+// profile: handleLaunch then opened profiles/<parent>/state.db (a phantom
+// per-id profile DB, invisible to the default-profile TUI) and the launch
+// subcommand's own --parent went unset, so the child was never linked. The
+// same collision affected `add -p <parent>` and `group move -p <position>`.
+// The long-form --parent was unaffected because it is not matched here.
 func extractProfileFlag(args []string) (string, []string) {
 	var profile string
 	var remaining []string
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+
+		// Reached the subcommand: global flag parsing is over. Everything from
+		// here belongs to the subcommand, which may define its own -p.
+		if globalFlagSubcommands[arg] {
+			remaining = append(remaining, args[i:]...)
+			return profile, remaining
+		}
 
 		// Check for -p=value or --profile=value
 		if strings.HasPrefix(arg, "-p=") {
@@ -1111,8 +1198,8 @@ func handleAdd(profile string, args []string) {
 	// is an alias for discoverability.
 	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
 	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
-	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
-	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
+	quickCreate := fs.Bool("quick", false, "Create a quick session with a machine-generated handle; TUI shows Claude's live task description when available")
+	quickCreateShort := fs.Bool("Q", false, "Create a quick session (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -1142,10 +1229,10 @@ func handleAdd(profile string, args []string) {
 
 	// Plugin enablement flag — repeatable, catalog-only, claude-only.
 	// Persisted on Instance.Plugins; resolved at spawn through
-	// [plugins.<name>] in ~/.agent-deck/config.toml and applied via the
+	// [plugins.<name>] in the user config and applied via the
 	// per-session scratch settings.json (RFC docs/rfc/PLUGIN_ATTACH.md).
 	var pluginFlags []string
-	fs.Func("plugin", "Catalog plugin to enable for this session (can specify multiple times); requires -c claude; configure in [plugins.<name>] in ~/.agent-deck/config.toml", func(s string) error {
+	fs.Func("plugin", fmt.Sprintf("Catalog plugin to enable for this session (can specify multiple times); requires -c claude; configure in [plugins.<name>] in %s", effectiveUserConfigPathForHelp()), func(s string) error {
 		pluginFlags = append(pluginFlags, s)
 		return nil
 	})
@@ -1158,6 +1245,9 @@ func handleAdd(profile string, args []string) {
 	// buildClaudeExtraFlags.
 	var extraArgFlags []string
 	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
+		if err := session.ValidateClaudeExtraArgToken(s); err != nil {
+			return err
+		}
 		extraArgFlags = append(extraArgFlags, s)
 		return nil
 	})
@@ -1194,7 +1284,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("Add a new session to Agent Deck.")
 		fmt.Println()
 		fmt.Println("Arguments:")
-		fmt.Println("  [path]    Project directory (defaults to current directory)")
+		fmt.Println("  [path]    Project directory (defaults to the group or global default_path, else current directory)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1215,7 +1305,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add -c gemini --yolo .")
 		fmt.Println("  agent-deck add -c claude -g work .   # -c is shorthand for --cmd")
 		fmt.Println("  agent-deck add -g ard --no-parent -c claude .")
-		fmt.Println("  agent-deck add --quick -c claude .   # Auto-generated name")
+		fmt.Println("  agent-deck add --quick -c claude .   # Quick session; TUI shows Claude's live task description")
 		fmt.Println()
 		fmt.Println("Worktree Examples:")
 		fmt.Println("  agent-deck add -w feature/login .    # Create worktree for existing branch")
@@ -1285,6 +1375,16 @@ func handleAdd(profile string, args []string) {
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 
+	// Seed groups declared in config.toml into the DB before resolving the
+	// new session's group and working directory.
+	if cfg, cfgErr := session.LoadUserConfig(); cfgErr == nil && cfg != nil {
+		if session.ReconcileDeclarativeGroups(groupTree, cfg) {
+			if err := storage.SaveGroupsOnly(groupTree); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to persist declarative groups: %v\n", err)
+			}
+		}
+	}
+
 	// Resolve parent session if specified
 	var parentInstance *session.Instance
 	if sessionParent != "" {
@@ -1304,11 +1404,11 @@ func handleAdd(profile string, args []string) {
 		// cwd-derived group is not available here. Passing "" preserves
 		// handleAdd's existing behavior; the #972 cwd-over-parent priority
 		// is wired into `launch` where path is already known at this point.
-		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
+		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 		} else {
 			parentInstance = nil
 		}
@@ -1326,9 +1426,15 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 	} else {
-		// No explicit path provided: use group default path first, then cwd fallback.
+		// No explicit path provided: use group default path first, then global
+		// config default_path, then cwd fallback.
 		if sessionGroup != "" {
 			path = groupTree.DefaultPathForGroup(sessionGroup)
+		}
+		if path == "" {
+			if userCfg, cfgErr := session.LoadUserConfig(); cfgErr == nil {
+				path = resolveConfiguredDefaultPath(userCfg.DefaultPath)
+			}
 		}
 		if path == "" {
 			path, err = os.Getwd()
@@ -1470,6 +1576,13 @@ func handleAdd(profile string, args []string) {
 		newInstance = session.NewInstanceWithGroup(sessionTitle, path, sessionGroup)
 	} else {
 		newInstance = session.NewInstance(sessionTitle, path)
+	}
+
+	// Quick mode generated a machine-named adjective-noun handle; mark it so the
+	// TUI shows Claude's live task description in place of the random name. This
+	// mirrors the exact condition used above to generate sessionTitle.
+	if isQuick && !userProvidedTitle {
+		newInstance.SetAutoName(true)
 	}
 
 	// Socket-isolation CLI override (issue #687 phase 1, v1.7.50). The
@@ -1615,9 +1728,11 @@ func handleAdd(profile string, args []string) {
 
 	// Rebuild group tree and save
 	groupTree = session.NewGroupTreeWithGroups(instances, groups)
+	mainCfg, _ := session.LoadUserConfig()
+	groupTree.DefaultMaxConcurrent = mainCfg.GroupDefaults.MaxConcurrent
 	// Ensure the session's group exists
 	if newInstance.GroupPath != "" {
-		groupTree.CreateGroup(newInstance.GroupPath)
+		groupTree.CreateGroupPath(newInstance.GroupPath)
 	}
 
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
@@ -1750,6 +1865,24 @@ func handleAdd(profile string, args []string) {
 	}
 }
 
+func resolveConfiguredDefaultPath(defaultPath string) string {
+	defaultPath = strings.TrimSpace(defaultPath)
+	if defaultPath == "" {
+		return ""
+	}
+
+	resolved, err := resolveAddPath(defaultPath)
+	if err != nil {
+		return ""
+	}
+
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	return resolved
+}
+
 // handleList lists all sessions
 func handleList(profile string, args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
@@ -1809,6 +1942,7 @@ func handleList(profile string, args []string) {
 			Model         string    `json:"model,omitempty"`
 			ModelVersion  string    `json:"model_version,omitempty"`
 			Status        string    `json:"status"`
+			Substate      string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
 			TmuxSession   string    `json:"tmux_session,omitempty"`
 			Profile       string    `json:"profile"`
 			CreatedAt     time.Time `json:"created_at"`
@@ -1832,6 +1966,7 @@ func handleList(profile string, args []string) {
 				Tool:          inst.Tool,
 				Command:       inst.Command,
 				Status:        StatusString(inst.Status),
+				Substate:      string(inst.Substate()),
 				Profile:       storage.Profile(),
 				CreatedAt:     inst.CreatedAt,
 				SSHHost:       inst.SSHHost,
@@ -2178,8 +2313,13 @@ func handleRename(profile string, args []string) {
 		}
 	}
 
-	inst.Title = newTitle
-	inst.SyncTmuxDisplayName()
+	// Route through SetField so the rename also sets TitleLocked — a direct
+	// Title assignment would be reverted by the #572 Claude-name sync on the
+	// next hook event.
+	if _, _, err := session.SetField(inst, session.FieldTitle, newTitle, nil); err != nil {
+		out.Error(fmt.Sprintf("failed to rename: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
@@ -2299,7 +2439,12 @@ func handleStatus(profile string, args []string) {
 			Model        string `json:"model,omitempty"`
 			ModelVersion string `json:"model_version,omitempty"`
 			Status       string `json:"status"`
-			Path         string `json:"path"`
+			// Substate is the additive Honest-Status-v2 refinement
+			// (model-unavailable, auth-401, idle-at-empty-prompt, running).
+			// ADDED, never renamed: existing fields stay byte-stable; omitempty
+			// so the default "" never appears in output.
+			Substate string `json:"substate,omitempty"`
+			Path     string `json:"path"`
 		}
 		type statusJSON struct {
 			Waiting  int                 `json:"waiting"`
@@ -2324,11 +2469,12 @@ func handleStatus(profile string, args []string) {
 			for _, inst := range instances {
 				_ = inst.UpdateStatus()
 				sj := statusSessionJSON{
-					ID:     inst.ID,
-					Title:  inst.Title,
-					Tool:   inst.Tool,
-					Status: StatusString(inst.Status),
-					Path:   inst.ProjectPath,
+					ID:       inst.ID,
+					Title:    inst.Title,
+					Tool:     inst.Tool,
+					Status:   StatusString(inst.Status),
+					Substate: string(inst.Substate()),
+					Path:     inst.ProjectPath,
 				}
 				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
 					sj.ModelID = modelInfo.ModelID
@@ -2361,7 +2507,11 @@ func handleStatus(profile string, args []string) {
 				if strings.HasPrefix(path, home) {
 					path = "~" + path[len(home):]
 				}
-				fmt.Printf("  %s %-16s %-10s %-22s %s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path)
+				suffix := ""
+				if lbl := SubstateLabel(inst.Substate()); lbl != "" {
+					suffix = "  [" + lbl + "]"
+				}
+				fmt.Printf("  %s %-16s %-10s %-22s %s%s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path, suffix)
 			}
 			fmt.Println()
 		}
@@ -2695,7 +2845,12 @@ func handleUpdate(args []string) {
 			os.Exit(1)
 		}
 	} else {
-		if err := update.PerformUpdate(info.DownloadURL); err != nil {
+		release, err := update.FetchReleaseByTag(info.LatestVersion)
+		if err != nil {
+			fmt.Printf("Error installing update: failed to fetch release info: %v\n", err)
+			os.Exit(1)
+		}
+		if err := update.PerformVerifiedUpdate(release, runtime.GOOS, runtime.GOARCH); err != nil {
 			fmt.Printf("Error installing update: %v\n", err)
 			os.Exit(1)
 		}
@@ -2785,7 +2940,7 @@ func handleUpdateToSpecificVersion(requested string, checkOnly bool) {
 	}
 
 	fmt.Println()
-	if err := update.PerformUpdate(downloadURL); err != nil {
+	if err := update.PerformVerifiedUpdate(release, runtime.GOOS, runtime.GOARCH); err != nil {
 		fmt.Printf("Error installing v%s: %v\n", targetVersion, err)
 		os.Exit(1)
 	}
@@ -2943,6 +3098,8 @@ func printHelp() {
 	fmt.Println("  skill            Manage project skills")
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
 	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
+	fmt.Println("  hermes-hooks     Manage Hermes Agent hook integration")
+	fmt.Println("  cursor-hooks     Manage Cursor Agent CLI hook integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
@@ -2952,6 +3109,7 @@ func printHelp() {
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
+	fmt.Println("  migrate-paths    Copy legacy ~/.agent-deck files into XDG paths")
 	fmt.Println("  uninstall        Uninstall Agent Deck")
 	fmt.Println("  version          Show version")
 	fmt.Println("  help             Show this help")
@@ -2960,7 +3118,7 @@ func printHelp() {
 	fmt.Println("  session start <id>        Start a session's tmux process")
 	fmt.Println("  session stop <id>         Stop session process")
 	fmt.Println("  session restart <id>      Restart session (reload MCPs)")
-	fmt.Println("  session fork <id>         Fork Claude session with context")
+	fmt.Println("  session fork <id>         Fork Claude or Pi session with context")
 	fmt.Println("  session attach <id>       Attach to session interactively")
 	fmt.Println("  session show [id]         Show session details")
 	fmt.Println()
@@ -2984,6 +3142,12 @@ func printHelp() {
 	fmt.Println("  gemini-hooks install      Install Gemini hooks")
 	fmt.Println("  gemini-hooks uninstall    Remove Gemini hooks")
 	fmt.Println("  gemini-hooks status       Show Gemini hooks install status")
+	fmt.Println("  hermes-hooks install      Install Hermes Agent hooks")
+	fmt.Println("  hermes-hooks uninstall    Remove Hermes Agent hooks")
+	fmt.Println("  hermes-hooks status       Show Hermes hooks install status")
+	fmt.Println("  cursor-hooks install      Install Cursor hooks")
+	fmt.Println("  cursor-hooks uninstall    Remove Cursor hooks")
+	fmt.Println("  cursor-hooks status       Show Cursor hooks install status")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")
@@ -3031,9 +3195,9 @@ func printHelp() {
 	fmt.Println("  agent-deck skill attach my-app react  # Attach skill to project")
 	fmt.Println("  agent-deck group move my-app work     # Move session to group")
 	fmt.Println("  agent-deck web                        # TUI + web server on 127.0.0.1:8420")
-	fmt.Println("  agent-deck web --listen :9000         # TUI + web on custom port")
+	fmt.Println("  agent-deck web --listen 127.0.0.1:9000  # TUI + web on a custom loopback port")
 	fmt.Println("  agent-deck web --read-only            # TUI + web in read-only mode")
-	fmt.Println("  agent-deck web --token secret         # TUI + web with auth token")
+	fmt.Println("  agent-deck web --token secret         # auth token (REQUIRED to bind a non-loopback address)")
 	fmt.Println("  agent-deck web --help                 # Show web command flags")
 	fmt.Println()
 	fmt.Println("Environment Variables:")
@@ -3075,70 +3239,41 @@ func truncate(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
-// detectTool determines the tool type from command
+// detectTool determines the tool type from a command string.
+//
+// Thin wrapper over the unified tool registry (issue #1258). The detection
+// heuristics that used to live in the switch below — including the "open-code"
+// alias for opencode and the whitespace-token match for short names like "pi" —
+// now live as per-entry data in internal/session/builtins.go and are applied by
+// Registry.Match(). Kept as a one-liner so existing callers don't churn.
 func detectTool(cmd string) string {
-	// Check custom tools first (exact match on original case)
-	if session.GetToolDef(cmd) != nil {
-		return cmd
-	}
-
-	cmd = strings.ToLower(cmd)
-	switch {
-	case strings.Contains(cmd, "claude"):
-		return "claude"
-	case strings.Contains(cmd, "opencode") || strings.Contains(cmd, "open-code"):
-		return "opencode"
-	case strings.Contains(cmd, "gemini"):
-		return "gemini"
-	case strings.Contains(cmd, "codex"):
-		return "codex"
-	case hasCommandToken(cmd, "pi"):
-		return "pi"
-	case strings.Contains(cmd, "copilot"):
-		return "copilot"
-	case strings.Contains(cmd, "crush"):
-		return "crush"
-	case strings.Contains(cmd, "cursor"):
-		return "cursor"
-	case strings.Contains(cmd, "hermes"):
-		return "hermes"
-	default:
-		return "shell"
-	}
-}
-
-// hasCommandToken reports whether `want` appears as a whitespace-delimited
-// token in `cmd` (case-insensitive). Used for short, ambiguous tool names
-// like "pi" where strings.Contains would falsely match "epic", "tapioca",
-// etc. Longer names like "copilot" or "claude" don't need this.
-func hasCommandToken(cmd, want string) bool {
-	return slices.Contains(strings.Fields(strings.ToLower(cmd)), want)
+	return session.MatchTool(cmd)
 }
 
 // handleUninstall removes agent-deck from the system
 func handleDebugDump() {
-	baseDir, err := session.GetAgentDeckDir()
+	cacheDir, err := ensureEffectiveCacheDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: cannot determine agent-deck dir: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: cannot determine agent-deck cache dir: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Initialize logging just enough to populate the ring buffer from the log file
 	logging.Init(logging.Config{
 		Debug:  true,
-		LogDir: baseDir,
+		LogDir: cacheDir,
 		Level:  "debug",
 	})
 	defer logging.Shutdown()
 
-	dumpPath := filepath.Join(baseDir, fmt.Sprintf("debug-dump-%d.jsonl", time.Now().Unix()))
+	dumpPath := filepath.Join(cacheDir, fmt.Sprintf("debug-dump-%d.jsonl", time.Now().Unix()))
 	if err := logging.DumpRingBuffer(dumpPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to dump ring buffer: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Also check if the debug.log file exists and report its path
-	debugLogPath := filepath.Join(baseDir, "debug.log")
+	debugLogPath := filepath.Join(cacheDir, "debug.log")
 	if info, statErr := os.Stat(debugLogPath); statErr == nil {
 		fmt.Printf("Debug log: %s (%.1f MB)\n", debugLogPath, float64(info.Size())/(1024*1024))
 	}
@@ -3148,7 +3283,7 @@ func handleDebugDump() {
 
 func handleUninstall(args []string) {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
-	keepData := fs.Bool("keep-data", false, "Keep ~/.agent-deck/ (sessions, config, logs)")
+	keepData := fs.Bool("keep-data", false, "Keep XDG config/data/cache locations and legacy ~/.agent-deck/")
 	keepTmuxConfig := fs.Bool("keep-tmux-config", false, "Keep tmux configuration")
 	dryRun := fs.Bool("dry-run", false, "Show what would be removed without removing")
 	yes := fs.Bool("y", false, "Skip confirmation prompts")
@@ -3160,7 +3295,7 @@ func handleUninstall(args []string) {
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  --dry-run           Show what would be removed without removing")
-		fmt.Println("  --keep-data         Keep ~/.agent-deck/ (sessions, config, logs)")
+		fmt.Println("  --keep-data         Keep XDG config/data/cache locations and legacy ~/.agent-deck/")
 		fmt.Println("  --keep-tmux-config  Keep tmux configuration")
 		fmt.Println("  -y                  Skip confirmation prompts")
 		fmt.Println()
@@ -3185,16 +3320,21 @@ func handleUninstall(args []string) {
 		fmt.Println()
 	}
 
-	homeDir, _ := os.UserHomeDir()
-	dataDir := filepath.Join(homeDir, ".agent-deck")
-
-	// Track what we find
-	type foundItem struct {
-		itemType    string
-		path        string
-		description string
+	// Resolve the home directory up front. Every path the uninstaller collects,
+	// backs up, and removes (binaries, tmux config, legacy data dir) is rooted
+	// here. If resolution fails or yields an empty string, those paths degrade
+	// to cwd-relative junk (e.g. ".tmux.conf") and we could back up / delete the
+	// wrong files. Abort before touching anything.
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		fmt.Fprintln(os.Stderr, "Error: cannot resolve home directory; refusing to uninstall with invalid paths")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "       %v\n", err)
+		}
+		os.Exit(1)
 	}
-	var foundItems []foundItem
+
+	var foundItems []uninstallFoundItem
 
 	// Check for Homebrew installation
 	homebrewInstalled := false
@@ -3202,7 +3342,7 @@ func handleUninstall(args []string) {
 		cmd := exec.Command("brew", "list", "agent-deck")
 		if cmd.Run() == nil {
 			homebrewInstalled = true
-			foundItems = append(foundItems, foundItem{"homebrew", "", "Homebrew package: agent-deck"})
+			foundItems = append(foundItems, uninstallFoundItem{"homebrew", "", "Homebrew package: agent-deck"})
 			fmt.Println("Found: Homebrew installation")
 		}
 	}
@@ -3224,70 +3364,23 @@ func handleUninstall(args []string) {
 			target, _ := os.Readlink(loc)
 			foundItems = append(
 				foundItems,
-				foundItem{"binary-symlink", loc, fmt.Sprintf("Binary (symlink) → %s", target)},
+				uninstallFoundItem{"binary-symlink", loc, fmt.Sprintf("Binary (symlink) → %s", target)},
 			)
 			fmt.Printf("Found: Binary (symlink) at %s\n", loc)
 			fmt.Printf("       → %s\n", target)
 		} else {
-			foundItems = append(foundItems, foundItem{"binary", loc, "Binary"})
+			foundItems = append(foundItems, uninstallFoundItem{"binary", loc, "Binary"})
 			fmt.Printf("Found: Binary at %s\n", loc)
 		}
 	}
 
-	// Check for data directory
-	if info, err := os.Stat(dataDir); err == nil && info.IsDir() {
-		// Count sessions and profiles
-		sessionCount := 0
-		profileCount := 0
-		profilesDir := filepath.Join(dataDir, "profiles")
-		if entries, err := os.ReadDir(profilesDir); err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() {
-					// Check for state.db (SQLite, v0.11.0+) or sessions.json (legacy)
-					dbFile := filepath.Join(profilesDir, entry.Name(), "state.db")
-					jsonFile := filepath.Join(profilesDir, entry.Name(), "sessions.json")
-					if _, err := os.Stat(dbFile); err == nil {
-						profileCount++
-						if s, err := session.NewStorageWithProfile(entry.Name()); err == nil {
-							if instances, _, err := s.LoadWithGroups(); err == nil {
-								sessionCount += len(instances)
-							}
-						}
-					} else if data, err := os.ReadFile(jsonFile); err == nil {
-						profileCount++
-						sessionCount += strings.Count(string(data), `"id"`)
-					}
-				}
-			}
-		}
-
-		// Get total size
-		var totalSize int64
-		_ = filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() {
-				totalSize += info.Size()
-			}
-			return nil
-		})
-		sizeStr := formatSize(totalSize)
-
-		foundItems = append(
-			foundItems,
-			foundItem{
-				"data",
-				dataDir,
-				fmt.Sprintf("%d profiles, %d sessions, %s", profileCount, sessionCount, sizeStr),
-			},
-		)
-		fmt.Printf("Found: Data directory at %s\n", dataDir)
-		fmt.Printf("       %d profiles, %d sessions, %s\n", profileCount, sessionCount, sizeStr)
-	}
+	foundItems = append(foundItems, collectUninstallDataLocations()...)
 
 	// Check for tmux config
 	tmuxConf := filepath.Join(homeDir, ".tmux.conf")
 	if data, err := os.ReadFile(tmuxConf); err == nil {
 		if strings.Contains(string(data), "# agent-deck configuration") {
-			foundItems = append(foundItems, foundItem{"tmux", tmuxConf, "tmux configuration block"})
+			foundItems = append(foundItems, uninstallFoundItem{"tmux", tmuxConf, "tmux configuration block"})
 			fmt.Println("Found: tmux configuration in ~/.tmux.conf")
 		}
 	}
@@ -3302,7 +3395,19 @@ func handleUninstall(args []string) {
 		for _, loc := range binaryLocations {
 			fmt.Printf("  - %s\n", loc)
 		}
-		fmt.Printf("  - %s\n", dataDir)
+		// List every data-location an uninstall would remove (XDG
+		// config/data/cache + legacy), resolved from the same source as the
+		// real removal so XDG-only installs are accurately represented. Dedupe
+		// in case XDG resolution falls back onto the legacy dir.
+		seenChecked := make(map[string]struct{})
+		for _, c := range uninstallDataCandidates() {
+			cleanPath := filepath.Clean(c.path)
+			if _, ok := seenChecked[cleanPath]; ok {
+				continue
+			}
+			seenChecked[cleanPath] = struct{}{}
+			fmt.Printf("  - %s (%s)\n", cleanPath, strings.ToLower(c.label))
+		}
 		fmt.Printf("  - %s (for agent-deck config)\n", tmuxConf)
 		return
 	}
@@ -3317,12 +3422,31 @@ func handleUninstall(args []string) {
 			fmt.Println("  • Homebrew package: agent-deck")
 		case "binary", "binary-symlink":
 			fmt.Printf("  • Binary: %s\n", item.path)
+		case "config":
+			if *keepData {
+				fmt.Printf("  ○ Config directory: %s (keeping)\n", item.path)
+			} else {
+				fmt.Printf("  • Config directory: %s\n", item.path)
+			}
 		case "data":
 			if *keepData {
 				fmt.Printf("  ○ Data directory: %s (keeping)\n", item.path)
 			} else {
 				fmt.Printf("  • Data directory: %s\n", item.path)
-				fmt.Println("    Including: sessions, logs, config")
+				fmt.Println("    Including: sessions, logs, runtime state")
+			}
+		case "cache":
+			if *keepData {
+				fmt.Printf("  ○ Cache directory: %s (keeping)\n", item.path)
+			} else {
+				fmt.Printf("  • Cache directory: %s\n", item.path)
+			}
+		case "legacy":
+			if *keepData {
+				fmt.Printf("  ○ Legacy directory: %s (keeping)\n", item.path)
+			} else {
+				fmt.Printf("  • Legacy directory: %s\n", item.path)
+				fmt.Println("    Including: pre-XDG sessions, config, logs, cache")
 			}
 		case "tmux":
 			if *keepTmuxConfig {
@@ -3471,39 +3595,57 @@ func handleUninstall(args []string) {
 		}
 	}
 
-	// 4. Data directory
+	// 4. XDG and legacy data locations
 	if !*keepData {
+		// Data-safety (Blocker 1, 2026-06-04 incident): back up EVERY data
+		// location that will be deleted (XDG config + data + cache + legacy),
+		// not just legacy ~/.agent-deck. Refuse to delete an un-backed-up XDG
+		// location.
+		backupCreated := false
+		if !*yes {
+			fmt.Print("Create a backup of ALL data locations (XDG config/data/cache + legacy) before removing them? [Y/n] ")
+			var response string
+			_, _ = fmt.Scanln(&response)
+			if strings.ToLower(response) != "n" {
+				fmt.Println("Creating backup of all data locations...")
+				backupFile, err := backupUninstallDataLocations(foundItems, homeDir)
+				if err != nil {
+					// Backup failed: do NOT delete data we couldn't archive.
+					fmt.Printf("✗ Backup failed: %v\n", err)
+					fmt.Println("Refusing to delete data locations without a backup.")
+					fmt.Println("Re-run with --keep-data to preserve data, or -y to skip backup and delete anyway.")
+					return
+				}
+				if backupFile != "" {
+					fmt.Printf("✓ Backup created: %s\n", backupFile)
+					backupCreated = true
+				} else {
+					fmt.Println("No real data found to back up (only symlinks/empty locations).")
+				}
+			} else {
+				// User explicitly declined the backup. Confirm they accept the
+				// irreversible deletion of every listed data location.
+				fmt.Print("Skip backup and permanently delete all listed data locations? [y/N] ")
+				var confirm string
+				_, _ = fmt.Scanln(&confirm)
+				if strings.ToLower(confirm) != "y" {
+					fmt.Println("Aborted. Data locations preserved.")
+					return
+				}
+			}
+		}
+		_ = backupCreated
+
 		for _, item := range foundItems {
-			if item.itemType != "data" {
+			if !isUninstallDataLocation(item.itemType) {
 				continue
 			}
 
-			// Offer backup unless -y flag
-			if !*yes {
-				fmt.Print("Create backup of data before removing? [Y/n] ")
-				var response string
-				_, _ = fmt.Scanln(&response)
-				if strings.ToLower(response) != "n" {
-					backupFile := filepath.Join(
-						homeDir,
-						fmt.Sprintf("agent-deck-backup-%s.tar.gz", time.Now().Format("20060102-150405")),
-					)
-					fmt.Printf("Creating backup at %s...\n", backupFile)
-
-					cmd := exec.Command("tar", "-czf", backupFile, "-C", homeDir, ".agent-deck")
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("Warning: failed to create backup: %v\n", err)
-					} else {
-						fmt.Printf("✓ Backup created: %s\n", backupFile)
-					}
-				}
-			}
-
-			fmt.Println("Removing data directory...")
-			if err := os.RemoveAll(dataDir); err != nil {
-				fmt.Printf("Warning: failed to remove data directory: %v\n", err)
+			fmt.Printf("Removing %s...\n", item.path)
+			if err := removeUninstallLocation(item.path); err != nil {
+				fmt.Printf("Warning: failed to remove %s: %v\n", item.path, err)
 			} else {
-				fmt.Printf("✓ Data directory removed: %s\n", dataDir)
+				fmt.Printf("✓ Removed: %s\n", item.path)
 			}
 		}
 	}
@@ -3515,8 +3657,8 @@ func handleUninstall(args []string) {
 	fmt.Println()
 
 	if *keepData {
-		fmt.Printf("Note: Data directory preserved at %s\n", dataDir)
-		fmt.Println("      Remove manually with: rm -rf ~/.agent-deck")
+		fmt.Println("Note: XDG config/data/cache locations and legacy ~/.agent-deck/ were preserved.")
+		fmt.Println("      Remove them manually with trash after reviewing their contents.")
 	}
 
 	if *keepTmuxConfig {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -27,10 +29,36 @@ var validInstanceID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 // hookPayload represents the JSON payload Claude Code sends to hooks via stdin.
 // Only the fields we need are decoded; unknown fields are ignored.
 type hookPayload struct {
-	HookEventName string          `json:"hook_event_name"`
-	SessionID     string          `json:"session_id"`
-	Source        string          `json:"source"`
-	Matcher       json.RawMessage `json:"matcher,omitempty"`
+	HookEventName  string          `json:"hook_event_name"`
+	SessionID      string          `json:"session_id"`
+	ConversationID string          `json:"conversation_id"`
+	Source         string          `json:"source"`
+	Matcher        json.RawMessage `json:"matcher,omitempty"`
+	// Cwd is the session's working directory (PROJECT_DIR) as reported by
+	// Claude Code on each hook event. Issue #1233: when a running session's
+	// registered worktree is renamed/removed, this points at a path that no
+	// longer exists; we use it to degrade gracefully rather than erroring on
+	// every tool call. Empty when the agent doesn't send a cwd (older Claude
+	// Code) — treated as "present" so behavior is unchanged.
+	Cwd string `json:"cwd"`
+	// StopHookActive is Claude Code's flag: true when this Stop is a
+	// continuation induced by a previous Stop-hook block. Issue #1225 uses it
+	// to bound consecutive inbox-drain blocks so the conductor cannot loop
+	// forever (resets the budget on a genuine user turn boundary).
+	//
+	// Audit B8: a *bool (not bool) so we can distinguish ABSENT from explicit
+	// false. A missing field must NOT be read as "fresh user turn" (which would
+	// reset the loop guard every Stop); resolveStopHookActive fails safe to true.
+	StopHookActive *bool `json:"stop_hook_active"`
+}
+
+// resolveStopHookActive fails safe (audit B8): an absent stop_hook_active is
+// treated as active=true (this Stop counts against the MaxStopHookBlocks budget)
+// rather than false (which would reset the budget). Only an EXPLICIT false — a
+// genuine user turn boundary that Claude Code is asserting — resets the guard.
+// This keeps the loop bounded even if Claude Code ever omits the field.
+func resolveStopHookActive(p hookPayload) bool {
+	return p.StopHookActive == nil || *p.StopHookActive
 }
 
 // hookStatusFile is the JSON written to ~/.agent-deck/hooks/{instance_id}.json
@@ -39,39 +67,65 @@ type hookStatusFile struct {
 	SessionID string `json:"session_id,omitempty"`
 	Event     string `json:"event"`
 	Timestamp int64  `json:"ts"`
+	// DoneStatus/DoneSummary carry a worker-printed completion sentinel
+	// detected on the Stop edge (issue #1186). omitempty so ordinary Stops
+	// (no sentinel) leave the fields absent, which the daemon reads as
+	// "no finished event to emit."
+	DoneStatus  string `json:"done_status,omitempty"`
+	DoneSummary string `json:"done_summary,omitempty"`
+	// TranscriptPath is persisted ONLY when the Stop-edge sentinel scan was
+	// inconclusive because the turn's assistant record had not flushed yet
+	// (issue #1186 flush race). The daemon re-scans this path on its poll
+	// loop; the synchronous Stop hook (#1225) must not wait out the flush.
+	TranscriptPath string `json:"transcript_path,omitempty"`
 }
 
-// mapEventToStatus maps a Claude Code hook event to an agent-deck status string.
+// normalizeHookEventKey folds hook event names from Claude (PascalCase), Cursor
+// (camelCase), Hermes (snake_case), and Codex into a single lookup key.
+func normalizeHookEventKey(event string) string {
+	s := strings.ToLower(strings.TrimSpace(event))
+	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(s)
+}
+
+func isStopHookEvent(event string) bool {
+	return normalizeHookEventKey(event) == "stop"
+}
+
+// mapEventToStatus maps a hook event to an agent-deck status string.
 // Status semantics in agent-deck:
-//   - "running" = Claude is actively processing (green)
-//   - "waiting" = Claude is at the prompt, waiting for user input (orange)
+//   - "running" = agent is actively processing (green)
+//   - "waiting" = agent is at the prompt, waiting for user input (orange)
 //   - "dead"    = Session ended
-//
-// Gemini mappings:
-//   - "BeforeAgent" = running
-//   - "AfterAgent"  = waiting
 func mapEventToStatus(event string) string {
-	switch event {
-	case "SessionStart":
-		return "waiting" // Claude at initial prompt, waiting for user input
-	case "BeforeAgent":
+	switch normalizeHookEventKey(event) {
+	case "sessionstart":
+		return "waiting" // at initial prompt, waiting for user input
+	case "beforeagent":
 		return "running" // Gemini received user input and is processing
-	case "AfterAgent":
+	case "afteragent":
 		return "waiting" // Gemini completed response, back to waiting
-	case "UserPromptSubmit":
-		return "running" // User sent prompt, Claude is processing
-	case "Stop":
-		return "waiting" // Claude finished, back at prompt waiting for user
-	case "PermissionRequest":
-		return "waiting" // Claude needs permission approval
-	case "Notification":
+	case "pretoolcall", "pretooluse":
+		return "running" // executing a tool call
+	case "posttoolcall", "posttooluse", "posttoolusefailure":
+		return "waiting" // finished a tool call, back at prompt
+	case "onsessionstart":
+		return "waiting" // Hermes session started, waiting for first prompt
+	case "onsessionend":
+		return "dead" // Hermes session ended
+	case "userpromptsubmit", "beforesubmitprompt":
+		return "running" // user sent prompt, agent is processing
+	case "stop":
+		return "waiting" // agent finished, back at prompt waiting for user
+	case "permissionrequest":
+		return "waiting" // agent needs permission approval
+	case "notification":
 		// Notification events with permission_prompt|elicitation_dialog matcher
 		// are mapped to "waiting" by the caller after checking the matcher.
 		// Default notification is informational, treat as no status change.
 		return ""
-	case "SessionEnd":
+	case "sessionend":
 		return "dead"
-	case "PreCompact":
+	case "precompact":
 		return "" // Observability only; context-% monitoring handles /clear proactively
 	default:
 		return ""
@@ -105,12 +159,23 @@ func handleHookHandler() {
 		return
 	}
 
+	// Issue #1233: gracefully degrade when the session's working directory
+	// (PROJECT_DIR / cwd) has been renamed or removed out from under a running
+	// session — e.g. a git worktree renamed while the session is live. Rather
+	// than emitting a FATAL-class error on every single tool call, log a single
+	// WARN (deduped per instance+path) that points at the moved path and
+	// suggests `agent-deck session move`, then soft-skip this invocation.
+	if projectDirMissing(payload.Cwd) {
+		warnProjectDirMissingOnce(instanceID, payload.Cwd)
+		return
+	}
+
 	// Map event to status
 	status := mapEventToStatus(payload.HookEventName)
 
 	// Special handling for Notification events: only map to "waiting" if
 	// the matcher indicates a permission prompt or elicitation dialog
-	if payload.HookEventName == "Notification" && payload.Matcher != nil {
+	if normalizeHookEventKey(payload.HookEventName) == "notification" && payload.Matcher != nil {
 		var matcher string
 		if err := json.Unmarshal(payload.Matcher, &matcher); err == nil {
 			if matcher == "permission_prompt" || matcher == "elicitation_dialog" {
@@ -124,13 +189,32 @@ func handleHookHandler() {
 		return
 	}
 
-	writeHookStatus(instanceID, status, payload.SessionID, payload.HookEventName)
+	// Issue #1186: on the Stop edge — the completion edge — scan the transcript
+	// tail for a worker-printed completion sentinel. When present, persist the
+	// parsed outcome into the hook status file so the daemon can emit a
+	// distinct "finished" event to the parent instead of the conductor having
+	// to poll artifacts. When the turn's assistant record has not flushed yet
+	// (Claude Code can fire Stop before appending it), persist the transcript
+	// path instead and let the daemon finish the scan — the Stop hook runs
+	// SYNCHRONOUSLY (#1225), so waiting out the flush here would add turn-end
+	// latency to every managed session. Absent on ordinary mid-task Stops, so
+	// the existing "waiting" behavior is unchanged.
+	sessionID := strings.TrimSpace(payload.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(payload.ConversationID)
+	}
+
+	if isStopHookEvent(payload.HookEventName) {
+		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, detectDoneSentinel(data))
+	} else {
+		writeHookStatus(instanceID, status, sessionID, payload.HookEventName)
+	}
 
 	// #572: Sync agent-deck title from Claude Code's --name / /rename value.
 	// Event-driven so user-facing rename lands within one hook tick; silent
 	// no-op when no name is set (sessions started without --name keep the
 	// existing agent-deck adjective-noun title).
-	applyClaudeTitleSync(instanceID, payload.SessionID)
+	applyClaudeTitleSync(instanceID, sessionID)
 
 	// Write cost event if this hook contains usage data
 	logCostDebug("hook event=%s instance=%s status=%s", payload.HookEventName, instanceID, status)
@@ -144,8 +228,27 @@ func handleHookHandler() {
 	// that exits with no decision falls through to Claude Code's default,
 	// which denies in UI-less contexts. Status-tracking behavior above is
 	// unchanged.
-	if payload.HookEventName == "PermissionRequest" && parentIsDSP() {
+	if normalizeHookEventKey(payload.HookEventName) == "permissionrequest" && parentIsDSP() {
 		fmt.Println(`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow"}}`)
+	}
+
+	// Issue #1225: on the Stop edge (the turn boundary), a parent drains its
+	// durable per-parent outbox and injects any pending child completions via
+	// {decision:"block",reason} — so a BUSY conductor still receives every
+	// completion at its very next free turn, with zero forced interrupts and
+	// zero loss. No-op when the inbox is empty (the common case for non-parent
+	// sessions), and bounded by a max-consecutive-block guard so it can't loop.
+	//
+	// NOTE: Claude Code only reads this decision when the Stop hook runs
+	// SYNCHRONOUSLY. The install flips the conductor's Stop hook to sync — see
+	// the maintainer note in the PR. Emitting here is harmless under the legacy
+	// async install (Claude ignores stdout) and activates once sync lands.
+	if isStopHookEvent(payload.HookEventName) {
+		if dec, blocked, derr := session.DrainForStopHook(instanceID, resolveStopHookActive(payload)); derr == nil && blocked {
+			if out, mErr := json.Marshal(dec); mErr == nil {
+				fmt.Println(string(out))
+			}
+		}
 	}
 }
 
@@ -168,7 +271,21 @@ func parentIsDSP() bool {
 }
 
 // writeHookStatus writes a hook status file atomically for one instance.
-func writeHookStatus(instanceID, status, sessionID, event string) {
+// The optional done argument carries a completion sentinel (issue #1186);
+// when supplied its status/summary are persisted alongside the hook status.
+func writeHookStatus(instanceID, status, sessionID, event string, done ...session.DoneSignal) {
+	scan := doneScanResult{}
+	if len(done) > 0 {
+		scan.signal = &done[0]
+	}
+	writeHookStatusWithScan(instanceID, status, sessionID, event, scan)
+}
+
+// writeHookStatusWithScan is writeHookStatus plus the full Stop-edge scan
+// outcome: a parsed sentinel persists as done_status/done_summary; an
+// unflushed tail persists as transcript_path so the daemon can finish the
+// scan (issue #1186 flush race).
+func writeHookStatusWithScan(instanceID, status, sessionID, event string, scan doneScanResult) {
 	if instanceID == "" || status == "" {
 		return
 	}
@@ -196,6 +313,11 @@ func writeHookStatus(instanceID, status, sessionID, event string) {
 		Event:     event,
 		Timestamp: time.Now().Unix(),
 	}
+	if scan.signal != nil {
+		statusFile.DoneStatus = scan.signal.Status
+		statusFile.DoneSummary = scan.signal.Summary
+	}
+	statusFile.TranscriptPath = scan.pendingTranscript
 
 	jsonData, err := json.Marshal(statusFile)
 	if err != nil {
@@ -244,6 +366,7 @@ func isTerminalHookEvent(event string) bool {
 	// sidecar on ordinary non-terminal "Stop"/turn-complete style events.
 	switch norm {
 	case "sessionend", "sessionended", "sessionclose", "sessionclosed", "sessiondone", "sessionexit", "sessionexited",
+		"onsessionend", // Hermes: on_session_end normalized
 		"threadend", "threadended", "threadterminate", "threadterminated", "threadclose", "threadclosed",
 		"threaddone", "threadexit", "threadexited":
 		return true
@@ -252,13 +375,48 @@ func isTerminalHookEvent(event string) bool {
 	}
 }
 
+// projectDirMissing reports whether cwd is a non-empty path that no longer
+// exists on disk. An empty cwd (older Claude Code, or hook events that omit
+// one) returns false — we can't tell, so behavior stays unchanged. Stat errors
+// other than "not exist" (e.g. permission) also return false: only a confirmed
+// missing directory triggers the degrade path.
+func projectDirMissing(cwd string) bool {
+	if cwd == "" {
+		return false
+	}
+	_, err := os.Stat(cwd)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// warnProjectDirMissingOnce logs a single WARN for a missing project dir and
+// records a marker so subsequent hook invocations for the same instance+path
+// stay silent. Because each hook runs as a fresh process, the "once" guard is
+// an on-disk marker (next to the hook status files) whose contents are the
+// missing path: if the session is later repointed to a different (also-missing)
+// path, the mismatch lets it warn again instead of being silenced by a stale
+// marker.
+func warnProjectDirMissingOnce(instanceID, cwd string) {
+	hooksDir := getHooksDir()
+	markerPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".projectdir-missing")
+
+	if existing, err := os.ReadFile(markerPath); err == nil && strings.TrimSpace(string(existing)) == cwd {
+		return // already warned for this exact missing path
+	}
+
+	hookHandlerLog.Warn("hook_projectdir_missing",
+		slog.String("instance", instanceID),
+		slog.String("project_dir", cwd),
+		slog.String("suggestion", "run `agent-deck session move <id|title> <new-path>` to repoint the session at its moved worktree"),
+	)
+
+	if err := os.MkdirAll(hooksDir, 0o700); err == nil {
+		_ = os.WriteFile(markerPath, []byte(cwd), 0o600)
+	}
+}
+
 // getHooksDir returns the path to the hooks status directory.
 func getHooksDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), ".agent-deck", "hooks")
-	}
-	return filepath.Join(home, ".agent-deck", "hooks")
+	return session.GetHooksDir()
 }
 
 // cleanStaleHookFiles removes hook status files older than 24 hours.
@@ -416,7 +574,7 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 		logCostDebug("payload parse error: %v", err)
 		return
 	}
-	if stop.HookEventName != "Stop" {
+	if !isStopHookEvent(stop.HookEventName) {
 		logCostDebug("not a Stop event, skipping")
 		return
 	}
@@ -425,20 +583,14 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 		return
 	}
 
-	// Validate transcript path to prevent path traversal.
-	// Claude stores transcripts under ~/.claude/projects/{hash}/{session}.jsonl
-	cleanPath := filepath.Clean(stop.TranscriptPath)
-	if strings.Contains(cleanPath, "..") {
-		logCostDebug("rejected transcript_path with path traversal: %s", stop.TranscriptPath)
+	// Validate transcript path through the shared fail-closed, boundary-aware
+	// containment guard (same check the done-sentinel reader uses) so a crafted
+	// payload can't coax this reader into opening an arbitrary file. Claude
+	// stores transcripts under ~/.claude/projects/{hash}/{session}.jsonl.
+	cleanPath, ok := session.ValidateTranscriptPath(stop.TranscriptPath)
+	if !ok {
+		logCostDebug("rejected transcript_path outside ~/.claude or traversal: %s", stop.TranscriptPath)
 		return
-	}
-	home, homeErr := os.UserHomeDir()
-	if homeErr == nil {
-		claudeDir := filepath.Join(home, ".claude")
-		if !strings.HasPrefix(cleanPath, claudeDir) {
-			logCostDebug("rejected transcript_path outside ~/.claude: %s", stop.TranscriptPath)
-			return
-		}
 	}
 	logCostDebug("transcript_path: %s", cleanPath)
 
@@ -526,65 +678,68 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 	logCostDebug("wrote cost event: %s model=%s in=%d out=%d", finalPath, cf.Model, cf.InputTokens, cf.OutputTokens)
 }
 
-// readLastLine reads the last non-empty line from a file.
-func readLastLine(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-
-	size := stat.Size()
-	if size == 0 {
-		return "", fmt.Errorf("empty file")
-	}
-
-	// Read backwards in chunks to find the last complete line
-	buf := make([]byte, 0, 16384)
-	offset := size
-
-	for offset > 0 {
-		readSize := int64(16384)
-		if readSize > offset {
-			readSize = offset
-		}
-		offset -= readSize
-
-		chunk := make([]byte, readSize)
-		if _, err := f.ReadAt(chunk, offset); err != nil {
-			return "", err
-		}
-		buf = append(chunk, buf...)
-
-		// Strip trailing whitespace/newlines for consistent handling
-		trimmed := strings.TrimRight(string(buf), "\n\r ")
-		// Find the last newline in the trimmed content
-		lastNL := strings.LastIndexByte(trimmed, '\n')
-		if lastNL >= 0 {
-			return trimmed[lastNL+1:], nil
-		}
-	}
-
-	// Entire file is one line
-	return strings.TrimSpace(string(buf)), nil
+// doneScanResult carries the Stop-edge sentinel-scan outcome into the hook
+// status file. At most one field is set: signal when a sentinel was parsed
+// from the flushed assistant turn; pendingTranscript (the validated
+// transcript path) when the tail was unflushed at hook time — issue #1186
+// flush race — so the daemon can finish the scan on its poll loop. The zero
+// value is an ordinary Stop with nothing extra to persist.
+type doneScanResult struct {
+	signal            *session.DoneSignal
+	pendingTranscript string
 }
 
-// logCostDebug writes debug messages to ~/.agent-deck/cost-debug.log
+// detectDoneSentinel parses transcript_path out of a Stop hook payload and
+// scans the transcript tail for a worker-printed completion sentinel
+// (issue #1186). Path-traversal / ~/.claude containment guards mirror the
+// cost path so a crafted payload can't read arbitrary files. The scan itself
+// lives in internal/session, shared with the transition daemon's flush-race
+// rescan.
+func detectDoneSentinel(rawPayload []byte) doneScanResult {
+	var stop stopHookPayload
+	if err := json.Unmarshal(rawPayload, &stop); err != nil {
+		return doneScanResult{}
+	}
+	cleanPath, ok := session.ValidateTranscriptPath(stop.TranscriptPath)
+	if !ok {
+		return doneScanResult{}
+	}
+	sig, found, pending := session.ScanTranscriptTailForDone(cleanPath)
+	switch {
+	case pending:
+		return doneScanResult{pendingTranscript: cleanPath}
+	case found:
+		return doneScanResult{signal: &sig}
+	default:
+		return doneScanResult{}
+	}
+}
+
+// readLastLine reads the last non-empty line from a file.
+func readLastLine(path string) (string, error) {
+	lines, err := session.TranscriptTailLines(path, 1)
+	if err != nil {
+		return "", err
+	}
+	if len(lines) == 0 {
+		return "", fmt.Errorf("no non-empty line")
+	}
+	return lines[0], nil
+}
+
+// logCostDebug writes debug messages to the XDG cache cost-debug.log.
 // Only active when AGENTDECK_DEBUG is set.
 func logCostDebug(format string, args ...any) {
 	if os.Getenv("AGENTDECK_DEBUG") == "" {
 		return
 	}
-	home, err := os.UserHomeDir()
+	logPath, err := effectiveCachePath("cost-debug.log")
 	if err != nil {
 		return
 	}
-	logPath := filepath.Join(home, ".agent-deck", "cost-debug.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return
+	}
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
@@ -596,11 +751,11 @@ func logCostDebug(format string, args ...any) {
 
 // getCostEventsDir returns the path to the cost events directory.
 func getCostEventsDir() string {
-	home, err := os.UserHomeDir()
+	path, err := agentpaths.EffectiveDataPath("cost-events", "cost-events")
 	if err != nil {
-		return filepath.Join(os.TempDir(), ".agent-deck", "cost-events")
+		return filepath.Join(os.TempDir(), "agent-deck", "cost-events")
 	}
-	return filepath.Join(home, ".agent-deck", "cost-events")
+	return path
 }
 
 // getClaudeConfigDirForHooks returns the Claude config directory for hook operations.

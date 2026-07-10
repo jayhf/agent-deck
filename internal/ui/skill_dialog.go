@@ -484,7 +484,7 @@ func (d *SkillDialog) renderEmptyStateHelp() string {
 		highlightStyle.Render("No pool skills available"),
 		"",
 		helpStyle.Render("Place reusable skills in:"),
-		pathStyle.Render("  ~/.agent-deck/skills/pool"),
+		pathStyle.Render("  " + skillPoolPathForDisplay()),
 		"",
 		helpStyle.Render("Only pool skills appear in Available."),
 	}
@@ -521,13 +521,7 @@ func (d *SkillDialog) View() string {
 		hint += lipgloss.NewStyle().Foreground(ColorTextDim).Render("  (" + d.typeJumpBuf + ")")
 	}
 
-	dialogWidth := 86
-	if d.width > 0 && d.width < dialogWidth+10 {
-		dialogWidth = d.width - 10
-		if dialogWidth < 56 {
-			dialogWidth = 56
-		}
-	}
+	dialogWidth := fitDialogWidth(86, 56, d.width)
 	titleWidth := dialogWidth - 4
 
 	parts := []string{

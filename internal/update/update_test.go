@@ -156,20 +156,21 @@ func TestFormatChangelogForDisplay(t *testing.T) {
 }
 
 func TestUpdateBridgePy_NoConductorDir(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	tmpHome := isolateUpdatePaths(t)
 
 	err := UpdateBridgePy()
 	require.NoError(t, err)
 
-	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
-	_, statErr := os.Stat(condDir)
-	assert.True(t, os.IsNotExist(statErr), "conductor dir should not be created when not installed")
+	legacyCondDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	xdgCondDir := filepath.Join(os.Getenv("XDG_DATA_HOME"), "agent-deck", "conductor")
+	_, legacyErr := os.Stat(legacyCondDir)
+	_, xdgErr := os.Stat(xdgCondDir)
+	assert.True(t, os.IsNotExist(legacyErr), "legacy conductor dir should not be created when not installed")
+	assert.True(t, os.IsNotExist(xdgErr), "XDG conductor dir should not be created when not installed")
 }
 
-func TestUpdateBridgePy_UsesEmbeddedTemplateAndBacksUpExistingFile(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+func TestUpdateBridgePy_UsesInjectedInstallerAndBacksUpExistingFile(t *testing.T) {
+	tmpHome := isolateUpdatePaths(t)
 
 	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
 	require.NoError(t, os.MkdirAll(condDir, 0o755))
@@ -177,6 +178,13 @@ func TestUpdateBridgePy_UsesEmbeddedTemplateAndBacksUpExistingFile(t *testing.T)
 	bridgePath := filepath.Join(condDir, "bridge.py")
 	legacyContent := "# legacy bridge\nprint('old bridge')\n"
 	require.NoError(t, os.WriteFile(bridgePath, []byte(legacyContent), 0o755))
+
+	SetBridgeScriptInstaller(func() error {
+		return os.WriteFile(bridgePath, []byte("# injected bridge\n"), 0o755)
+	})
+	t.Cleanup(func() {
+		SetBridgeScriptInstaller(nil)
+	})
 
 	err := UpdateBridgePy()
 	require.NoError(t, err)
@@ -188,8 +196,148 @@ func TestUpdateBridgePy_UsesEmbeddedTemplateAndBacksUpExistingFile(t *testing.T)
 
 	newContent, err := os.ReadFile(bridgePath)
 	require.NoError(t, err)
-	assert.True(t, strings.Contains(string(newContent), "Conductor Bridge: Telegram & Slack"),
-		"bridge.py should be refreshed from the embedded multi-platform template")
+	assert.Equal(t, "# injected bridge\n", string(newContent))
+}
+
+// TestUpdateBridgePy_NonCLICallerDoesNotHardFail is the regression test for
+// Blocker 3. The bridge installer is injected only by the CLI layer
+// (initUpdateSettings). A non-CLI caller (e.g. a watcher or library consumer)
+// that triggers UpdateBridgePy with a conductor dir present must NOT hard-fail
+// with "bridge.py installer is not configured" — it should gracefully no-op so
+// the surrounding update flow is not aborted.
+func TestUpdateBridgePy_NonCLICallerDoesNotHardFail(t *testing.T) {
+	tmpHome := isolateUpdatePaths(t)
+
+	// Conductor dir exists (so we get past the "not installed" early return),
+	// exercising the installer branch.
+	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	require.NoError(t, os.MkdirAll(condDir, 0o755))
+
+	// Simulate a non-CLI caller: installer never injected.
+	SetBridgeScriptInstaller(nil)
+
+	err := UpdateBridgePy()
+	require.NoError(t, err, "UpdateBridgePy must not hard-fail when installer is not configured (non-CLI caller)")
+}
+
+// TestUpdateBridgePy_NoOpLeavesExistingBackupUntouched is the regression test
+// for Blocker 3's data-safety contract: when there is no injected installer the
+// function advertises a true no-op ("the existing bridge.py and its .backup are
+// left untouched"). Previously the .backup was overwritten with the current
+// bridge.py BEFORE the nil-installer check ran, silently corrupting a prior
+// good backup. This asserts the no-op truly does not read or rewrite .backup.
+func TestUpdateBridgePy_NoOpLeavesExistingBackupUntouched(t *testing.T) {
+	tmpHome := isolateUpdatePaths(t)
+
+	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	require.NoError(t, os.MkdirAll(condDir, 0o755))
+
+	bridgePath := filepath.Join(condDir, "bridge.py")
+	backupPath := bridgePath + ".backup"
+
+	// A live bridge.py and a PRE-EXISTING, distinct .backup (e.g. from an
+	// earlier successful update). The no-op must not overwrite the backup with
+	// the current bridge.py content.
+	require.NoError(t, os.WriteFile(bridgePath, []byte("# current bridge\n"), 0o755))
+	priorBackup := "# prior good backup\nprint('keep me')\n"
+	require.NoError(t, os.WriteFile(backupPath, []byte(priorBackup), 0o644))
+
+	// Non-CLI caller: installer never injected -> no-op path.
+	SetBridgeScriptInstaller(nil)
+
+	err := UpdateBridgePy()
+	require.NoError(t, err)
+
+	// The pre-existing backup must be byte-for-byte intact.
+	gotBackup, err := os.ReadFile(backupPath)
+	require.NoError(t, err)
+	assert.Equal(t, priorBackup, string(gotBackup), "no-op must not touch bridge.py.backup")
+
+	// bridge.py itself must also be unchanged.
+	gotBridge, err := os.ReadFile(bridgePath)
+	require.NoError(t, err)
+	assert.Equal(t, "# current bridge\n", string(gotBridge), "no-op must not touch bridge.py")
+}
+
+// TestUpdateBridgePy_HonorsConductorDirOverride is the regression test for the
+// update-path bypass: UpdateBridgePy previously resolved its conductor dir via
+// agentpaths.EffectiveDataPath (the default XDG/legacy path), ignoring
+// [conductor].dir. With an override pointing outside the default, the existence
+// guard, the .backup, and the refresh all targeted the wrong directory. The fix
+// routes through the injected conductorDirResolver (session.ConductorDir).
+//
+// This test pins the behavior WITHOUT importing internal/session: it injects a
+// resolver returning a custom override dir and asserts the backup + refresh land
+// there, not under the default conductor root.
+func TestUpdateBridgePy_HonorsConductorDirOverride(t *testing.T) {
+	tmpHome := isolateUpdatePaths(t)
+
+	// The override lives OUTSIDE the default XDG/legacy conductor roots.
+	override := filepath.Join(t.TempDir(), "conductor homes", "conductor")
+	require.NoError(t, os.MkdirAll(override, 0o755))
+
+	overrideBridge := filepath.Join(override, "bridge.py")
+	legacyContent := "# pre-existing override bridge\n"
+	require.NoError(t, os.WriteFile(overrideBridge, []byte(legacyContent), 0o755))
+
+	SetConductorDirResolver(func() (string, error) { return override, nil })
+	SetBridgeScriptInstaller(func() error {
+		return os.WriteFile(overrideBridge, []byte("# refreshed override bridge\n"), 0o755)
+	})
+	t.Cleanup(func() {
+		SetConductorDirResolver(nil)
+		SetBridgeScriptInstaller(nil)
+	})
+
+	require.NoError(t, UpdateBridgePy())
+
+	// Backup + refresh must land under the OVERRIDE dir.
+	backup, err := os.ReadFile(overrideBridge + ".backup")
+	require.NoError(t, err)
+	assert.Equal(t, legacyContent, string(backup), "backup must be written under the override dir")
+
+	refreshed, err := os.ReadFile(overrideBridge)
+	require.NoError(t, err)
+	assert.Equal(t, "# refreshed override bridge\n", string(refreshed), "refresh must target the override dir")
+
+	// The default conductor roots must be untouched — proving the guard used the
+	// override, not agentpaths' default resolution.
+	legacyCondDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	xdgCondDir := filepath.Join(os.Getenv("XDG_DATA_HOME"), "agent-deck", "conductor")
+	_, legacyErr := os.Stat(legacyCondDir)
+	_, xdgErr := os.Stat(xdgCondDir)
+	assert.True(t, os.IsNotExist(legacyErr), "default legacy conductor dir must not be touched")
+	assert.True(t, os.IsNotExist(xdgErr), "default XDG conductor dir must not be touched")
+}
+
+// TestUpdateBridgePy_OverrideGuardSkipsWhenOverrideMissing complements the
+// positive test: when the override dir does NOT exist, UpdateBridgePy must skip
+// (early return) EVEN IF the default conductor root exists. Pre-fix, the guard
+// keyed off the default dir and would have refreshed it; the fix keys off the
+// resolved override.
+func TestUpdateBridgePy_OverrideGuardSkipsWhenOverrideMissing(t *testing.T) {
+	tmpHome := isolateUpdatePaths(t)
+
+	// Default legacy conductor root EXISTS...
+	defaultCondDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	require.NoError(t, os.MkdirAll(defaultCondDir, 0o755))
+
+	// ...but the override points at a non-existent dir.
+	override := filepath.Join(t.TempDir(), "missing", "conductor")
+	SetConductorDirResolver(func() (string, error) { return override, nil })
+
+	installerCalled := false
+	SetBridgeScriptInstaller(func() error {
+		installerCalled = true
+		return nil
+	})
+	t.Cleanup(func() {
+		SetConductorDirResolver(nil)
+		SetBridgeScriptInstaller(nil)
+	})
+
+	require.NoError(t, UpdateBridgePy())
+	assert.False(t, installerCalled, "installer must not run when the override dir is missing (guard must key off the override, not the default)")
 }
 
 func TestNormalizeReleaseTag(t *testing.T) {
@@ -260,6 +408,120 @@ func TestFetchReleaseByTag(t *testing.T) {
 		_, err := FetchReleaseByTag("  ")
 		require.Error(t, err)
 	})
+}
+
+func TestPerformVerifiedUpdate_MatchingChecksumInstalls(t *testing.T) {
+	oldBinary := []byte("old-agent-deck")
+	newBinary := []byte("new-agent-deck")
+	execPath := selfUpdateTestTarget(t, oldBinary)
+
+	archive := makeTarGz(t, newBinary)
+	checksums := []byte(sha256hex(archive) + "  agent-deck_1.2.3_linux_amd64.tar.gz\n")
+	rel, cleanup := selfUpdateReleaseServer(t, archive, checksums, http.StatusOK)
+	defer cleanup()
+
+	err := PerformVerifiedUpdate(rel, "linux", "amd64")
+	require.NoError(t, err)
+
+	installed, err := os.ReadFile(execPath)
+	require.NoError(t, err)
+	assert.Equal(t, newBinary, installed)
+}
+
+func TestPerformVerifiedUpdate_MissingChecksumEntryLeavesBinaryUntouched(t *testing.T) {
+	oldBinary := []byte("old-agent-deck")
+	newBinary := []byte("new-agent-deck")
+	execPath := selfUpdateTestTarget(t, oldBinary)
+
+	archive := makeTarGz(t, newBinary)
+	checksums := []byte(sha256hex(archive) + "  agent-deck_1.2.3_windows_amd64.tar.gz\n")
+	rel, cleanup := selfUpdateReleaseServer(t, archive, checksums, http.StatusOK)
+	defer cleanup()
+
+	err := PerformVerifiedUpdate(rel, "linux", "amd64")
+	require.Error(t, err)
+	assert.Contains(t, strings.ToLower(err.Error()), "no published sha-256 checksum")
+
+	installed, readErr := os.ReadFile(execPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, oldBinary, installed)
+}
+
+func TestPerformVerifiedUpdate_MismatchedChecksumLeavesBinaryUntouched(t *testing.T) {
+	oldBinary := []byte("old-agent-deck")
+	newBinary := []byte("new-agent-deck")
+	execPath := selfUpdateTestTarget(t, oldBinary)
+
+	archive := makeTarGz(t, newBinary)
+	checksums := []byte(sha256hex([]byte("different archive")) + "  agent-deck_1.2.3_linux_amd64.tar.gz\n")
+	rel, cleanup := selfUpdateReleaseServer(t, archive, checksums, http.StatusOK)
+	defer cleanup()
+
+	err := PerformVerifiedUpdate(rel, "linux", "amd64")
+	require.Error(t, err)
+	assert.Contains(t, strings.ToLower(err.Error()), "mismatch")
+
+	installed, readErr := os.ReadFile(execPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, oldBinary, installed)
+}
+
+func TestPerformVerifiedUpdate_ChecksumsDownloadFailureLeavesBinaryUntouched(t *testing.T) {
+	oldBinary := []byte("old-agent-deck")
+	newBinary := []byte("new-agent-deck")
+	execPath := selfUpdateTestTarget(t, oldBinary)
+
+	archive := makeTarGz(t, newBinary)
+	rel, cleanup := selfUpdateReleaseServer(t, archive, nil, http.StatusNotFound)
+	defer cleanup()
+
+	err := PerformVerifiedUpdate(rel, "linux", "amd64")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checksums.txt")
+	assert.Contains(t, err.Error(), "status 404")
+
+	installed, readErr := os.ReadFile(execPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, oldBinary, installed)
+}
+
+func selfUpdateTestTarget(t *testing.T, initial []byte) string {
+	t.Helper()
+
+	isolateUpdatePaths(t)
+	execPath := filepath.Join(t.TempDir(), "agent-deck")
+	require.NoError(t, os.WriteFile(execPath, initial, 0o755))
+
+	orig := detectHomebrewManagedInstall
+	detectHomebrewManagedInstall = func() (string, string, bool, error) {
+		return execPath, "", false, nil
+	}
+	t.Cleanup(func() { detectHomebrewManagedInstall = orig })
+
+	return execPath
+}
+
+func selfUpdateReleaseServer(t *testing.T, archive, checksums []byte, checksumsStatus int) (*Release, func()) {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/agent-deck_1.2.3_linux_amd64.tar.gz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(archive)
+	})
+	mux.HandleFunc("/checksums.txt", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(checksumsStatus)
+		_, _ = w.Write(checksums)
+	})
+	srv := httptest.NewServer(mux)
+
+	rel := &Release{
+		TagName: "v1.2.3",
+		Assets: []Asset{
+			{Name: "agent-deck_1.2.3_linux_amd64.tar.gz", BrowserDownloadURL: srv.URL + "/agent-deck_1.2.3_linux_amd64.tar.gz"},
+			{Name: ChecksumsAssetName, BrowserDownloadURL: srv.URL + "/checksums.txt"},
+		},
+	}
+	return rel, srv.Close
 }
 
 func TestHomebrewUpgradeHint(t *testing.T) {

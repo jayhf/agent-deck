@@ -3,6 +3,7 @@ package update
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 )
 
 const (
@@ -36,11 +37,36 @@ var checkInterval = DefaultCheckInterval
 // apiBaseURL is the base URL for GitHub API calls. Overridable in tests.
 var apiBaseURL = "https://api.github.com"
 
+// detectHomebrewManagedInstall is a test seam for self-update install paths.
+var detectHomebrewManagedInstall = DetectHomebrewManagedInstall
+
+// bridgeScriptInstaller refreshes the conductor bridge script. It is injected
+// by the CLI layer so this package stays independent of internal/session.
+var bridgeScriptInstaller func() error
+
+// conductorDirResolver resolves the base conductor directory, honoring the
+// [conductor].dir config override. It is injected by the CLI layer (same
+// pattern as bridgeScriptInstaller) so this package stays independent of
+// internal/session and avoids an import cycle. When nil (non-CLI callers),
+// UpdateBridgePy falls back to the default XDG/legacy resolution.
+var conductorDirResolver func() (string, error)
+
 // SetCheckInterval sets the update check interval from config
 func SetCheckInterval(hours int) {
 	if hours > 0 {
 		checkInterval = time.Duration(hours) * time.Hour
 	}
+}
+
+// SetBridgeScriptInstaller configures the bridge.py installer used after updates.
+func SetBridgeScriptInstaller(installer func() error) {
+	bridgeScriptInstaller = installer
+}
+
+// SetConductorDirResolver configures the resolver used to locate the base
+// conductor directory (honoring the [conductor].dir override) after updates.
+func SetConductorDirResolver(resolver func() (string, error)) {
+	conductorDirResolver = resolver
 }
 
 // Release represents a GitHub release
@@ -109,11 +135,7 @@ func isUpdateCheckSkipped() bool {
 
 // getCacheDir returns the cache directory path
 func getCacheDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".agent-deck"), nil
+	return agentpaths.CacheDir()
 }
 
 // loadCache loads the update cache from disk
@@ -384,35 +406,6 @@ func FetchReleaseByTag(tag string) (*Release, error) {
 	return &release, nil
 }
 
-// DownloadAndExtractBinary downloads a release tarball and returns the binary bytes.
-func DownloadAndExtractBinary(downloadURL string) ([]byte, error) {
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(downloadURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("download failed with status %d", resp.StatusCode)
-	}
-
-	tmpFile, err := os.CreateTemp("", "agent-deck-update-*.tar.gz")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err = io.Copy(tmpFile, resp.Body); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("failed to save download: %w", err)
-	}
-	tmpFile.Close()
-
-	return extractBinaryFromTarGz(tmpPath)
-}
-
 // CompareVersions compares two semantic versions
 // Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
 func CompareVersions(v1, v2 string) int {
@@ -536,7 +529,7 @@ func PerformUpdate(downloadURL string) error {
 		return fmt.Errorf("no download URL available for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	execPath, upgradeCmd, managed, err := DetectHomebrewManagedInstall()
+	execPath, upgradeCmd, managed, err := detectHomebrewManagedInstall()
 	if err != nil {
 		return fmt.Errorf("failed to detect install type: %w", err)
 	}
@@ -580,6 +573,32 @@ func PerformUpdate(downloadURL string) error {
 		return fmt.Errorf("failed to extract: %w", err)
 	}
 
+	return installSelfUpdateBinary(execPath, binaryData)
+}
+
+// PerformVerifiedUpdate downloads, verifies, extracts, and installs a release
+// binary for the requested platform. It fails closed: checksum download,
+// missing-entry, or hash mismatch errors occur before the installed binary is
+// touched.
+func PerformVerifiedUpdate(release *Release, goos, goarch string) error {
+	execPath, upgradeCmd, managed, err := detectHomebrewManagedInstall()
+	if err != nil {
+		return fmt.Errorf("failed to detect install type: %w", err)
+	}
+	if managed {
+		return fmt.Errorf("homebrew-managed install detected at %s; use `%s`", execPath, upgradeCmd)
+	}
+
+	fmt.Printf("Downloading and verifying %s/%s release binary...\n", goos, goarch)
+	binaryData, err := DownloadVerifiedBinary(release, goos, goarch)
+	if err != nil {
+		return fmt.Errorf("download/verify failed: %w", err)
+	}
+
+	return installSelfUpdateBinary(execPath, binaryData)
+}
+
+func installSelfUpdateBinary(execPath string, binaryData []byte) error {
 	// Create temp file for new binary
 	newBinaryPath := execPath + ".new"
 	if err := os.WriteFile(newBinaryPath, binaryData, 0755); err != nil {
@@ -800,15 +819,27 @@ func FormatChangelogForDisplay(entries []ChangelogEntry) string {
 	return sb.String()
 }
 
-// extractBinaryFromTarGz extracts the agent-deck binary from a .tar.gz file
+// extractBinaryFromTarGz extracts the agent-deck binary from a .tar.gz file.
 func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
 	file, err := os.Open(tarPath)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+	return extractBinaryFromTarGzReader(file)
+}
 
-	gzr, err := gzip.NewReader(file)
+// extractBinaryFromTarGzBytes extracts the agent-deck binary from an in-memory
+// .tar.gz, used by the verified-download path so the archive bytes can be
+// SHA-256'd before extraction (#1206).
+func extractBinaryFromTarGzBytes(data []byte) ([]byte, error) {
+	return extractBinaryFromTarGzReader(bytes.NewReader(data))
+}
+
+// extractBinaryFromTarGzReader extracts the agent-deck binary from a gzipped
+// tar stream.
+func extractBinaryFromTarGzReader(r io.Reader) ([]byte, error) {
+	gzr, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, err
 	}
@@ -841,18 +872,39 @@ func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
 // UpdateBridgePy refreshes the installed bridge.py from the embedded runtime template.
 // This keeps bridge behavior in sync with the currently running binary.
 func UpdateBridgePy() error {
-	// Get the conductor directory
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+	// Resolve the conductor dir via the injected resolver so the existence
+	// guard, the .backup, and the refresh all target the [conductor].dir
+	// override when set. Fall back to the default XDG/legacy path only for
+	// non-CLI callers that never injected a resolver.
+	var conductorDir string
+	var err error
+	if conductorDirResolver != nil {
+		conductorDir, err = conductorDirResolver()
+	} else {
+		conductorDir, err = agentpaths.EffectiveDataPath("conductor", "conductor")
 	}
-
-	conductorDir := filepath.Join(home, ".agent-deck", "conductor")
+	if err != nil {
+		return fmt.Errorf("failed to resolve conductor directory: %w", err)
+	}
 	bridgePath := filepath.Join(conductorDir, "bridge.py")
 
 	// Check if conductor directory exists
 	if _, err := os.Stat(conductorDir); os.IsNotExist(err) {
 		// Conductor not installed, skip update
+		return nil
+	}
+
+	// No-op guard MUST run before any side effect (Blocker 3 fix).
+	//
+	// The installer is injected by the CLI layer (initUpdateSettings) to keep
+	// this package independent of internal/session. Non-CLI callers (watchers,
+	// library consumers) won't have injected it. Rather than hard-failing and
+	// aborting the surrounding update flow, gracefully no-op with a clear log.
+	// This early return guarantees the advertised contract: when there is no
+	// installer, the existing bridge.py AND its .backup are left untouched (we
+	// neither print "Updating", nor read, nor overwrite bridge.py.backup).
+	if bridgeScriptInstaller == nil {
+		fmt.Println("⚠ bridge.py installer not configured (non-CLI caller); skipping bridge.py refresh.")
 		return nil
 	}
 
@@ -870,7 +922,7 @@ func UpdateBridgePy() error {
 	}
 
 	// Install latest bridge template from embedded runtime.
-	if err := session.InstallBridgeScript(); err != nil {
+	if err := bridgeScriptInstaller(); err != nil {
 		return fmt.Errorf("failed to install bridge.py: %w", err)
 	}
 

@@ -21,13 +21,18 @@ import (
 // Falls back to subprocess execution when pipes are unavailable.
 type PipeManager struct {
 	pipes map[string]*ControlPipe // sessionName -> pipe
-	mu    sync.RWMutex
+	mu    sync.RWMutex            // protects pipes and wantPipe
 
 	// Callback for output events (invoked when %output detected from a session)
 	onOutput func(sessionName string)
 
 	// Callback for window change events (invoked when %window-add or %window-close detected)
 	onWindowChange func()
+
+	// wantPipe, when non-nil, gates which sessions may hold a live pipe.
+	// Connect and watchPipe consult it so background sessions are never
+	// connected or auto-reconnected. nil = legacy behaviour (want everything).
+	wantPipe func(sessionName string) bool
 
 	// Reconnection tracking
 	reconnectMu  sync.Mutex
@@ -58,6 +63,13 @@ func NewPipeManager(ctx context.Context, onOutput func(sessionName string)) *Pip
 // by socketName (Session.SocketName). Pass "" to target the user's default
 // server. Safe to call repeatedly; a live pipe short-circuits and returns nil.
 func (pm *PipeManager) Connect(sessionName, socketName string) error {
+	// Background sessions are not wanted — connecting them is what scaled pipe
+	// count to instances×sessions. Silent no-op so existing callers (startup
+	// loop, new-session hook, reviver, sweep) need no per-call gating.
+	if !pm.wants(sessionName) {
+		return nil
+	}
+
 	pm.mu.Lock()
 
 	// Already connected and alive?
@@ -178,32 +190,71 @@ func (pm *PipeManager) GetWindowActivity(sessionName string) (int64, error) {
 	return ts, nil
 }
 
-// RefreshAllActivities sends a single list-windows command through any available
-// pipe to get activity timestamps for ALL sessions. This replaces the subprocess
-// call in RefreshSessionCache.
+// selectPipesPerSocket returns one alive pipe for each distinct socket among
+// the given pipes. `list-windows -a` only reports sessions on the server its
+// pipe is attached to, so a single arbitrary pipe misses every session living
+// on another socket. When agent-deck sessions are split across more than one
+// tmux server (e.g. some on the default socket, some under [tmux] socket_name),
+// querying just one pipe makes the others' sessions look gone — they flip to
+// StatusError/tmux_missing and can then be killed by restart machinery. Probing
+// one pipe per socket and merging keeps the cache complete. Dead pipes are
+// skipped. See the multi-socket cache aliasing note.
+func selectPipesPerSocket(pipes map[string]*ControlPipe) []*ControlPipe {
+	seen := make(map[string]bool)
+	var selected []*ControlPipe
+	for _, p := range pipes {
+		if p == nil || !p.IsAlive() {
+			continue
+		}
+		if seen[p.socketName] {
+			continue
+		}
+		seen[p.socketName] = true
+		selected = append(selected, p)
+	}
+	return selected
+}
+
+// RefreshAllActivities sends a list-windows command through one pipe per distinct
+// socket to get activity timestamps for ALL sessions across every tmux server we
+// have a live pipe to. This replaces the subprocess call in RefreshSessionCache.
+// Session names carry random suffixes, so cross-socket name collisions are
+// effectively impossible and merging by name is safe.
 func (pm *PipeManager) RefreshAllActivities() (map[string]int64, map[string][]WindowInfo, error) {
 	pm.mu.RLock()
-	// Find any alive pipe to send the command through
-	var pipe *ControlPipe
-	for _, p := range pm.pipes {
-		if p.IsAlive() {
-			pipe = p
-			break
-		}
-	}
+	pipes := selectPipesPerSocket(pm.pipes)
 	pm.mu.RUnlock()
 
-	if pipe == nil {
+	if len(pipes) == 0 {
 		return nil, nil, fmt.Errorf("no alive pipes available")
 	}
 
-	// tmux control mode requires double-quoted format strings containing special chars
-	output, err := pipe.SendCommand(`list-windows -a -F "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}"`)
-	if err != nil {
-		return nil, nil, fmt.Errorf("list-windows via pipe: %w", err)
+	sessionCache := make(map[string]int64)
+	windowCache := make(map[string][]WindowInfo)
+	var firstErr error
+	gotAny := false
+	for _, pipe := range pipes {
+		// Must use the same tmuxFieldSep as parseListWindowsOutput (shared with the
+		// subprocess path). A control client negotiates UTF-8, so TAB would usually
+		// survive here, but the delimiter MUST still match what the parser splits on.
+		// tmux control mode requires the format string double-quoted.
+		output, err := pipe.SendCommand(`list-windows -a -F "` + tmuxFmt("#{session_name}", "#{window_activity}", "#{window_index}", "#{window_name}") + `"`)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		gotAny = true
+		sc, wc := parseListWindowsOutput(output)
+		maps.Copy(sessionCache, sc)
+		maps.Copy(windowCache, wc)
 	}
 
-	sessionCache, windowCache := parseListWindowsOutput(output)
+	if !gotAny {
+		return nil, nil, fmt.Errorf("list-windows via pipe: %w", firstErr)
+	}
+
 	return sessionCache, windowCache, nil
 }
 
@@ -226,51 +277,15 @@ func (pm *PipeManager) RefreshAllPaneInfo() (map[string]PaneInfo, map[string]map
 		return nil, nil, fmt.Errorf("no alive pipes available")
 	}
 
-	output, err := pipe.SendCommand(`list-panes -a -F "#{session_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}\t#{window_index}\t#{pane_index}"`)
+	// Share the producer format AND parser with the subprocess path
+	// (parseListPanesOutput): pane_title last, tmuxFieldSep-delimited. Keeps the
+	// pipe and subprocess paths from drifting in field order or delimiter.
+	output, err := pipe.SendCommand(`list-panes -a -F "` + tmuxFmt("#{session_name}", "#{pane_current_command}", "#{pane_dead}", "#{window_index}", "#{pane_index}", "#{pane_title}") + `"`)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list-panes via pipe: %w", err)
 	}
 
-	result := make(map[string]PaneInfo)
-	windowTools := make(map[string]map[int]string)
-	seenWindowTool := make(map[string]bool) // "session\twinIdx" -> already processed
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 6)
-		if len(parts) != 6 {
-			continue
-		}
-		name := parts[0]
-
-		// Collect tool info for the first pane of each window (handles any base-index).
-		windowKey := name + "\t" + parts[4]
-		if !seenWindowTool[windowKey] {
-			seenWindowTool[windowKey] = true
-			var winIdx int
-			_, _ = fmt.Sscanf(parts[4], "%d", &winIdx)
-			tool := detectToolFromCommand(parts[2])
-			if tool == "" {
-				tool = detectToolFromCommand(parts[1])
-			}
-			if tool != "" {
-				if windowTools[name] == nil {
-					windowTools[name] = make(map[int]string)
-				}
-				windowTools[name][winIdx] = tool
-			}
-		}
-
-		// Cache the first pane seen per session (primary window+pane).
-		if _, seen := result[name]; !seen {
-			result[name] = PaneInfo{
-				Title:          parts[1],
-				CurrentCommand: parts[2],
-				Dead:           parts[3] == "1",
-			}
-		}
-	}
+	result, windowTools := parseListPanesOutput(output)
 	return result, windowTools, nil
 }
 
@@ -330,6 +345,36 @@ func (pm *PipeManager) SetWindowChangeCallback(cb func()) {
 	pm.onWindowChange = cb
 }
 
+// SetWantPipe installs the predicate that decides which sessions hold a live
+// pipe. Call once at startup before Connect. nil-safe: an unset predicate means
+// every session is wanted (legacy behaviour).
+func (pm *PipeManager) SetWantPipe(fn func(sessionName string) bool) {
+	pm.mu.Lock()
+	pm.wantPipe = fn
+	pm.mu.Unlock()
+}
+
+// wants reports whether sessionName is currently wanted. nil predicate => true.
+func (pm *PipeManager) wants(sessionName string) bool {
+	pm.mu.RLock()
+	fn := pm.wantPipe
+	pm.mu.RUnlock()
+	return fn == nil || fn(sessionName)
+}
+
+// ConnectedSessions returns the names of sessions with an alive pipe.
+func (pm *PipeManager) ConnectedSessions() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	out := make([]string, 0, len(pm.pipes))
+	for name, p := range pm.pipes {
+		if p.IsAlive() {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // forwardOutputEvents reads from a pipe's output and window events channels
 // and calls the appropriate callbacks. Runs until the pipe dies or context is cancelled.
 func (pm *PipeManager) forwardOutputEvents(sessionName string, pipe *ControlPipe) {
@@ -357,6 +402,28 @@ func (pm *PipeManager) forwardOutputEvents(sessionName string, pipe *ControlPipe
 	}
 }
 
+// shouldConcludeSessionGone decides whether a failed has-session probe during
+// reconnect means the session is permanently gone, or just a transient miss to
+// retry. A tmux server that is briefly busy (e.g. tearing down another session)
+// can make the probe report absent for a session that is actually alive, so a
+// single early miss must not delete the pipe. Only a probe still absent on the
+// final attempt — after the retry/backoff window lets contention clear —
+// concludes the session is gone.
+func shouldConcludeSessionGone(probeFoundSession bool, attempt, maxRetries int) bool {
+	if probeFoundSession {
+		return false
+	}
+	return attempt >= maxRetries-1
+}
+
+// wantsReconnect reports whether a dead pipe for sessionName should be
+// reconnected. nil predicate => yes (legacy). A false result means the session
+// fell out of the live set (intentional Disconnect, or a background pipe died)
+// and must stay gone.
+func wantsReconnect(wantPipe func(string) bool, sessionName string) bool {
+	return wantPipe == nil || wantPipe(sessionName)
+}
+
 // watchPipe monitors a pipe and attempts reconnection when it dies.
 // Uses exponential backoff: 2s, 4s, 8s, 16s, 30s max.
 // Stops retrying if the tmux session no longer exists.
@@ -369,6 +436,19 @@ func (pm *PipeManager) watchPipe(sessionName string, pipe *ControlPipe) {
 	}
 
 	pipeLog.Debug("pipe_died_scheduling_reconnect", slog.String("session", sessionName))
+
+	// If the session is no longer wanted (intentional Disconnect, or a
+	// background pipe that died), do not resurrect it.
+	pm.mu.RLock()
+	wantFn := pm.wantPipe
+	pm.mu.RUnlock()
+	if !wantsReconnect(wantFn, sessionName) {
+		pipeLog.Debug("pipe_not_wanted_skipping_reconnect", slog.String("session", sessionName))
+		pm.mu.Lock()
+		delete(pm.pipes, sessionName)
+		pm.mu.Unlock()
+		return
+	}
 
 	// Check if already reconnecting
 	pm.reconnectMu.Lock()
@@ -396,13 +476,30 @@ func (pm *PipeManager) watchPipe(sessionName string, pipe *ControlPipe) {
 		case <-time.After(backoff):
 		}
 
+		// Wantedness can flip during backoff (the session fell out of the live
+		// set, or was intentionally disconnected). Re-check before reconnecting:
+		// otherwise pm.Connect silently no-ops on an unwanted session, returns
+		// nil, and we'd log a phantom "reconnected" while leaving the dead pipe
+		// entry in the map. Prune it and stop instead.
+		pm.mu.RLock()
+		loopWantFn := pm.wantPipe
+		pm.mu.RUnlock()
+		if !wantsReconnect(loopWantFn, sessionName) {
+			pipeLog.Debug("pipe_not_wanted_skipping_reconnect", slog.String("session", sessionName))
+			pm.mu.Lock()
+			delete(pm.pipes, sessionName)
+			pm.mu.Unlock()
+			return
+		}
+
 		// Check if session still exists before trying to reconnect.
 		// Avoids infinite reconnect loops for deleted/non-existent sessions.
 		// Target the same socket the original pipe lived on — checking the
 		// default server for a session that lives on an isolated agent-deck
 		// socket would answer "no" and silently delete a healthy pipe.
 		reconnectSocket := pipe.socketName
-		if !tmuxSessionExistsOnSocket(reconnectSocket, sessionName) {
+		exists := tmuxSessionExistsOnSocket(reconnectSocket, sessionName)
+		if shouldConcludeSessionGone(exists, attempt, maxRetries) {
 			pipeLog.Debug("pipe_reconnect_session_gone",
 				slog.String("session", sessionName),
 				slog.String("socket", reconnectSocket))
@@ -410,6 +507,20 @@ func (pm *PipeManager) watchPipe(sessionName string, pipe *ControlPipe) {
 			delete(pm.pipes, sessionName)
 			pm.mu.Unlock()
 			return
+		}
+		if !exists {
+			// Probe reported absent but this may be transient tmux-server
+			// contention, not a real death. Back off and retry rather than
+			// deleting a pipe whose session is still alive (the cascade where
+			// one torn-down session flips its neighbors to error).
+			pipeLog.Debug("pipe_reconnect_probe_miss_retry",
+				slog.String("session", sessionName),
+				slog.Int("attempt", attempt+1))
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
 		}
 
 		err := pm.Connect(sessionName, reconnectSocket)
@@ -719,9 +830,19 @@ func softKillProcessGroup(pgid int, grace time.Duration) bool {
 // tmux `-L <name>` selector (Session.SocketName / Instance.TmuxSocketName);
 // pass "" for the default server. All callers (watchPipe reconnect loop,
 // public HasSession/HasSessionOnSocket in tmux.go) go through this.
+//
+// The probe is bounded by hasSessionProbeTimeout: a tmux server that is briefly
+// busy can make `has-session` stall, and a stalled probe is indeterminate — we
+// assume the session still exists (return true) rather than blocking the caller
+// or reporting a live session as gone. A probe that completes is trusted.
 func tmuxSessionExistsOnSocket(socketName, name string) bool {
-	cmd := tmuxExec(socketName, "has-session", "-t", name)
-	return cmd.Run() == nil
+	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
+	defer cancel()
+	err := tmuxExecContext(ctx, socketName, "has-session", "-t", name).Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return true // probe timed out: indeterminate, assume the session still exists
+	}
+	return err == nil
 }
 
 // --- Global singleton ---

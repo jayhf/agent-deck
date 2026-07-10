@@ -8,41 +8,56 @@ import (
 )
 
 const (
-	hotkeyQuit            = "quit"
-	hotkeyNewSession      = "new_session"
-	hotkeyQuickCreate     = "quick_create"
-	hotkeyRename          = "rename"
-	hotkeyRestart         = "restart"
-	hotkeyRestartFresh    = "restart_fresh"
-	hotkeyDelete          = "delete"
-	hotkeyCloseSession    = "close_session"
-	hotkeyUndoDelete      = "undo_delete"
-	hotkeyMoveToGroup     = "move_to_group"
-	hotkeyMCPManager      = "mcp_manager"
-	hotkeyPluginManager   = "plugin_manager"
-	hotkeySkillsManager   = "skills_manager"
-	hotkeyTogglePreview   = "toggle_preview"
-	hotkeyMarkUnread      = "mark_unread"
-	hotkeyQuickApprove    = "quick_approve"
-	hotkeyToggleYolo      = "toggle_yolo"
-	hotkeyQuickFork       = "quick_fork"
-	hotkeyForkWithOptions = "fork_with_options"
-	hotkeyCopyOutput      = "copy_output"
-	hotkeySendOutput      = "send_output"
-	hotkeyExecShell       = "exec_shell"
-	hotkeyEditNotes       = "edit_notes"
-	hotkeyEditPaths       = "edit_paths"
-	hotkeyEditSession     = "edit_session"
-	hotkeyOpenEditor      = "open_editor"
-	hotkeyWorktreeFinish  = "worktree_finish"
-	hotkeyCreateGroup     = "create_group"
-	hotkeySearch          = "search"
-	hotkeyHelp            = "help"
-	hotkeySettings        = "settings"
-	hotkeyImport          = "import"
-	hotkeyReload          = "reload"
-	hotkeyDetach          = "detach"
-	hotkeyWatcherPanel    = "watcher_panel"
+	hotkeyQuit             = "quit"
+	hotkeyNewSession       = "new_session"
+	hotkeyQuickCreate      = "quick_create"
+	hotkeyRename           = "rename"
+	hotkeyRestart          = "restart"
+	hotkeyRestartFresh     = "restart_fresh"
+	hotkeyDelete           = "delete"
+	hotkeyCloseSession     = "close_session"
+	hotkeyArchiveSession   = "archive_session"
+	hotkeyUnarchiveSession = "unarchive_session"
+	hotkeyViewArchived     = "view_archived"
+	hotkeyUndoDelete       = "undo_delete"
+	hotkeyMoveToGroup      = "move_to_group"
+	hotkeyMCPManager       = "mcp_manager"
+	hotkeyPluginManager    = "plugin_manager"
+	hotkeySkillsManager    = "skills_manager"
+	hotkeyTogglePreview    = "toggle_preview"
+	hotkeyCycleGroupView   = "cycle_group_view"
+	hotkeyMarkUnread       = "mark_unread"
+	hotkeyQuickApprove     = "quick_approve"
+	hotkeyPromptSession    = "prompt_session" // #1410: prompt the highlighted session without attaching
+	hotkeyToggleYolo       = "toggle_yolo"
+	hotkeyQuickFork        = "quick_fork"
+	hotkeyForkWithOptions  = "fork_with_options"
+	hotkeyCopyOutput       = "copy_output"
+	hotkeySendOutput       = "send_output"
+	hotkeyExecShell        = "exec_shell"
+	hotkeyEditNotes        = "edit_notes"
+	hotkeyEditPaths        = "edit_paths"
+	hotkeyEditSession      = "edit_session"
+	hotkeyOpenEditor       = "open_editor"
+	hotkeyWorktreeSetup    = "worktree_setup"
+	hotkeyWorktreeFinish   = "worktree_finish"
+	hotkeyCreateGroup      = "create_group"
+	hotkeySearch           = "search"
+	hotkeyHelp             = "help"
+	hotkeySettings         = "settings"
+	hotkeyImport           = "import"
+	hotkeyReload           = "reload"
+	hotkeyDetach           = "detach"
+	hotkeyWatcherPanel     = "watcher_panel"
+	// Session switcher. While attached it is intercepted in the tmux attach
+	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
+	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
+	//
+	// Disabled by default (see defaultDisabledHotkeys): intercepting it while
+	// attached steals the control byte from the attached program, and the
+	// suggested Ctrl+S collides with Claude Code (stash prompt) and XOFF
+	// flow-control. Users opt in by binding [hotkeys].switch_session.
+	hotkeySwitchSession = "switch_session" // canonical "ctrl+s" (opt-in)
 )
 
 var hotkeyActionOrder = []string{
@@ -54,14 +69,19 @@ var hotkeyActionOrder = []string{
 	hotkeyRestartFresh,
 	hotkeyDelete,
 	hotkeyCloseSession,
+	hotkeyArchiveSession,
+	hotkeyUnarchiveSession,
+	hotkeyViewArchived,
 	hotkeyUndoDelete,
 	hotkeyMoveToGroup,
 	hotkeyMCPManager,
 	hotkeyPluginManager,
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
+	hotkeyCycleGroupView,
 	hotkeyMarkUnread,
 	hotkeyQuickApprove,
+	hotkeyPromptSession,
 	hotkeyToggleYolo,
 	hotkeyQuickFork,
 	hotkeyForkWithOptions,
@@ -72,6 +92,7 @@ var hotkeyActionOrder = []string{
 	hotkeyEditPaths,
 	hotkeyEditSession,
 	hotkeyOpenEditor,
+	hotkeyWorktreeSetup,
 	hotkeyWorktreeFinish,
 	hotkeyCreateGroup,
 	hotkeySearch,
@@ -81,44 +102,52 @@ var hotkeyActionOrder = []string{
 	hotkeyReload,
 	hotkeyDetach,
 	hotkeyWatcherPanel,
+	hotkeySwitchSession,
 }
 
 var defaultHotkeyBindings = map[string]string{
-	hotkeyQuit:            "q",
-	hotkeyNewSession:      "n",
-	hotkeyQuickCreate:     "N",
-	hotkeyRename:          "r",
-	hotkeyRestart:         "R",
-	hotkeyRestartFresh:    "T",
-	hotkeyDelete:          "d",
-	hotkeyCloseSession:    "D",
-	hotkeyUndoDelete:      "ctrl+z",
-	hotkeyMoveToGroup:     "M",
-	hotkeyMCPManager:      "m",
-	hotkeyPluginManager:   "L",
-	hotkeySkillsManager:   "s",
-	hotkeyTogglePreview:   "v",
-	hotkeyMarkUnread:      "u",
-	hotkeyQuickApprove:    "a",
-	hotkeyToggleYolo:      "y",
-	hotkeyQuickFork:       "f",
-	hotkeyForkWithOptions: "F",
-	hotkeyCopyOutput:      "c",
-	hotkeySendOutput:      "x",
-	hotkeyExecShell:       "E",
-	hotkeyEditNotes:       "e",
-	hotkeyEditPaths:       "p",
-	hotkeyEditSession:     "P",
-	hotkeyOpenEditor:      "o",
-	hotkeyWorktreeFinish:  "W",
-	hotkeyCreateGroup:     "g",
-	hotkeySearch:          "/",
-	hotkeyHelp:            "?",
-	hotkeySettings:        "S",
-	hotkeyImport:          "i",
-	hotkeyReload:          "ctrl+r",
-	hotkeyDetach:          "ctrl+q",
-	hotkeyWatcherPanel:    "w",
+	hotkeyQuit:             "q",
+	hotkeyNewSession:       "n",
+	hotkeyQuickCreate:      "N",
+	hotkeyRename:           "r",
+	hotkeyRestart:          "R",
+	hotkeyRestartFresh:     "T",
+	hotkeyDelete:           "d",
+	hotkeyCloseSession:     "D",
+	hotkeyArchiveSession:   "A",
+	hotkeyUnarchiveSession: "shift+u",
+	hotkeyViewArchived:     "^",
+	hotkeyUndoDelete:       "ctrl+z",
+	hotkeyMoveToGroup:      "M",
+	hotkeyMCPManager:       "m",
+	hotkeyPluginManager:    "L",
+	hotkeySkillsManager:    "s",
+	hotkeyTogglePreview:    "v",
+	hotkeyCycleGroupView:   "t",
+	hotkeyMarkUnread:       "u",
+	hotkeyQuickApprove:     "a",
+	hotkeyPromptSession:    "o",
+	hotkeyToggleYolo:       "y",
+	hotkeyQuickFork:        "f",
+	hotkeyForkWithOptions:  "F",
+	hotkeyCopyOutput:       "c",
+	hotkeySendOutput:       "x",
+	hotkeyExecShell:        "E",
+	hotkeyEditNotes:        "e",
+	hotkeyEditPaths:        "p",
+	hotkeyEditSession:      "P",
+	hotkeyOpenEditor:       "O",
+	hotkeyWorktreeSetup:    "b",
+	hotkeyWorktreeFinish:   "W",
+	hotkeyCreateGroup:      "g",
+	hotkeySearch:           "/",
+	hotkeyHelp:             "?",
+	hotkeySettings:         "S",
+	hotkeyImport:           "i",
+	hotkeyReload:           "ctrl+r",
+	hotkeyDetach:           "ctrl+q",
+	hotkeyWatcherPanel:     "w",
+	hotkeySwitchSession:    "ctrl+s",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
@@ -132,6 +161,18 @@ var hotkeyActionDefaultTriggers = map[string][]string{
 // renamedHotkeys maps old action names to new names for backward compatibility.
 var renamedHotkeys = map[string]string{
 	"toggle_gemini_yolo": hotkeyToggleYolo,
+}
+
+// defaultDisabledHotkeys are actions that keep a canonical key in
+// defaultHotkeyBindings (so the home-screen dispatch case and help/status
+// labels resolve) but ship UNBOUND: resolveHotkeys drops them unless the user
+// binds them explicitly. switch_session is opt-in because enabling it
+// intercepts a control byte in the attach loop before the attached program
+// sees it — the suggested Ctrl+S collides with Claude Code's stash-prompt and
+// terminal XOFF flow-control, and no control byte is safe to steal from every
+// attached tool.
+var defaultDisabledHotkeys = map[string]bool{
+	hotkeySwitchSession: true,
 }
 
 func resolveHotkeys(overrides map[string]string) map[string]string {
@@ -175,6 +216,15 @@ func resolveHotkeys(overrides map[string]string) map[string]string {
 			continue
 		}
 		bindings[action] = key
+	}
+
+	// Opt-in actions ship unbound: drop them unless the user set them
+	// explicitly. The canonical default stays in defaultHotkeyBindings so the
+	// dispatch case and labels resolve once a user binds it.
+	for action := range defaultDisabledHotkeys {
+		if _, overridden := canonicalOverrides[action]; !overridden {
+			delete(bindings, action)
+		}
 	}
 
 	return bindings
@@ -392,4 +442,40 @@ func ResolvedDetachByte(overrides map[string]string) byte {
 		return 17 // default Ctrl+Q
 	}
 	return DetachByteFromBinding(key)
+}
+
+// ctrlByteFromBinding converts a "ctrl+<letter>" binding to its control byte, or
+// returns 0 when the binding is not a single-control-key chord. Unlike
+// DetachByteFromBinding it does not fall back to Ctrl+Q, so callers can treat 0
+// as "no portable byte for this key" (e.g. "ctrl+tab" / "ctrl+shift+tab", which
+// have no legacy control byte).
+func ctrlByteFromBinding(binding string) byte {
+	binding = strings.ToLower(strings.TrimSpace(binding))
+	if !strings.HasPrefix(binding, "ctrl+") {
+		return 0
+	}
+	ch := binding[len("ctrl+"):]
+	if len(ch) == 1 && ch[0] >= 'a' && ch[0] <= 'z' {
+		return ch[0] - 'a' + 1
+	}
+	switch ch {
+	case "\\":
+		return 0x1C
+	case "]":
+		return 0x1D
+	case "^":
+		return 0x1E
+	case "_":
+		return 0x1F
+	}
+	return 0
+}
+
+// ResolvedSwitchByte returns the control byte that opens the in-attach session
+// switcher for the current hotkey overrides, or 0 when it is unbound or not a
+// ctrl+<letter> chord. The switcher's forward/backward cycling and commit are
+// handled in the TUI, so only this single opener byte reaches the attach loop.
+func ResolvedSwitchByte(overrides map[string]string) byte {
+	bindings := resolveHotkeys(overrides)
+	return ctrlByteFromBinding(actionHotkey(bindings, hotkeySwitchSession))
 }

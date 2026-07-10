@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/atomicfile"
 )
 
 // agentDeckHookCommand is the marker command used to identify agent-deck hooks in settings.json.
@@ -42,7 +44,16 @@ var hookEventConfigs = []struct {
 }{
 	{Event: "SessionStart", Async: true},
 	{Event: "UserPromptSubmit", Async: true},
-	{Event: "Stop", Async: true},
+	// Issue #1225/#1226 ACTIVATION: Stop is SYNCHRONOUS so Claude Code reads the
+	// {decision:"block",reason} the hook emits to inject busy-parent completions.
+	// Audit B12 (global-flip risk) is mitigated by RUNTIME scope, not a per-session
+	// install (hooks are per config-dir, shared by conductor + workers):
+	//   - DrainForStopHook fast-returns with no block and ZERO ledger writes for any
+	//     session with an empty inbox (every leaf/non-conductor session) — inert flip.
+	//   - The MaxStopHookBlocks loop guard is crash-safe (B4) and fails safe on an
+	//     absent stop_hook_active flag (B8), so it cannot be defeated into a loop.
+	// Canary one conductor before flipping fleet-wide (GAP §5).
+	{Event: "Stop", Async: false},
 	// PermissionRequest is synchronous so the hook handler's stdout decision is
 	// consulted by Claude Code. In headless / /remote-control contexts an async
 	// hook with no UI fallback caused silent deny; the sync hook plus an
@@ -113,13 +124,8 @@ func InjectClaudeHooks(configDir string) (bool, error) {
 		return false, fmt.Errorf("create config dir: %w", err)
 	}
 
-	tmpPath := settingsPath + ".tmp"
-	if err := os.WriteFile(tmpPath, finalData, 0644); err != nil {
-		return false, fmt.Errorf("write settings.json.tmp: %w", err)
-	}
-	if err := os.Rename(tmpPath, settingsPath); err != nil {
-		os.Remove(tmpPath)
-		return false, fmt.Errorf("rename settings.json: %w", err)
+	if err := atomicfile.WriteFile(settingsPath, finalData, 0644); err != nil {
+		return false, fmt.Errorf("write settings.json: %w", err)
 	}
 
 	sessionLog.Info("claude_hooks_installed", slog.String("config_dir", configDir))
@@ -186,13 +192,8 @@ func RemoveClaudeHooks(configDir string) (bool, error) {
 		return false, fmt.Errorf("marshal settings: %w", err)
 	}
 
-	tmpPath := settingsPath + ".tmp"
-	if err := os.WriteFile(tmpPath, finalData, 0644); err != nil {
-		return false, fmt.Errorf("write settings.json.tmp: %w", err)
-	}
-	if err := os.Rename(tmpPath, settingsPath); err != nil {
-		os.Remove(tmpPath)
-		return false, fmt.Errorf("rename settings.json: %w", err)
+	if err := atomicfile.WriteFile(settingsPath, finalData, 0644); err != nil {
+		return false, fmt.Errorf("write settings.json: %w", err)
 	}
 
 	sessionLog.Info("claude_hooks_removed", slog.String("config_dir", configDir))

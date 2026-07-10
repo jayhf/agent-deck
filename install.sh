@@ -26,6 +26,40 @@
 #   - Windows - via WSL (uses Linux binary, clipboard via clip.exe)
 #
 
+# verify_download_checksum verifies that file $1 (a downloaded release asset
+# named $2) matches the SHA-256 recorded for it in the checksums.txt body passed
+# as $3. Defined at top level (outside main) so it is unit-testable in isolation
+# (see internal/releasetests/issue1206_install_checksum_test.go). Fails closed:
+#   return 0 -> verified         return 2 -> no checksum entry for this asset
+#   return 1 -> hash mismatch     return 3 -> no sha256 tool available
+# Security: without this, `curl | bash` would extract and run a tampered or
+# MITM'd binary with no integrity check (audit H1).
+verify_download_checksum() {
+    local file="$1" asset="$2" checksums="$3"
+    local expected actual
+
+    # checksums.txt lines are "<hex><spaces><name>"; tolerate a "*" binary-mode
+    # marker on the name (as emitted by `sha256sum -b`).
+    expected=$(printf '%s\n' "$checksums" | awk -v a="$asset" \
+        '{name=$2; sub(/^\*/,"",name); if (name==a) {print $1; exit}}')
+    if [[ -z "$expected" ]]; then
+        return 2
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}')
+    else
+        return 3
+    fi
+
+    # Case-insensitive hex compare without relying on bash 4 ${var,,}.
+    expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+    actual=$(printf '%s' "$actual" | tr 'A-F' 'a-f')
+    [[ -n "$actual" && "$expected" == "$actual" ]]
+}
+
 # Wrap in main() so the entire script is read before execution.
 # Without this, `curl | bash` can fail because `read` commands
 # consume script bytes from stdin, or hit EOF with set -e.
@@ -531,6 +565,32 @@ if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/agent-deck.tar.gz"; then
     exit 1
 fi
 
+# Verify SHA-256 before extracting/running the downloaded binary (audit H1).
+# goreleaser publishes checksums.txt alongside the archives (.goreleaser.yml
+# checksum.name_template). Fail closed: if checksums.txt cannot be fetched, the
+# asset is absent from it, or the hash mismatches, abort WITHOUT extracting.
+echo -e "Verifying checksum..."
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
+ASSET_NAME="agent-deck_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+CHECKSUMS=$(curl -fsSL "$CHECKSUMS_URL" 2>/dev/null || true)
+if [[ -z "$CHECKSUMS" ]]; then
+    echo -e "${RED}Error: could not fetch checksums.txt for ${VERSION}${NC}"
+    echo "Refusing to install an unverified binary. URL: $CHECKSUMS_URL"
+    exit 1
+fi
+if verify_download_checksum "$TMP_DIR/agent-deck.tar.gz" "$ASSET_NAME" "$CHECKSUMS"; then
+    echo -e "${GREEN}Checksum verified.${NC}"
+else
+    rc=$?
+    case "$rc" in
+        2) echo -e "${RED}Error: no published SHA-256 for ${ASSET_NAME} in checksums.txt${NC}" ;;
+        3) echo -e "${RED}Error: no sha256sum/shasum tool available to verify the download${NC}" ;;
+        *) echo -e "${RED}Error: SHA-256 mismatch for ${ASSET_NAME}${NC}" ;;
+    esac
+    echo "Refusing to install a tampered or corrupt artifact."
+    exit 1
+fi
+
 echo -e "Extracting..."
 tar -xzf "$TMP_DIR/agent-deck.tar.gz" -C "$TMP_DIR"
 
@@ -566,7 +626,7 @@ configure_tmux() {
     local TMUX_CONF="$HOME/.tmux.conf"
     local MARKER="# agent-deck configuration"
     local VERSION_MARKER="# agent-deck-tmux-config-version:"
-    local CURRENT_VERSION="3"  # Bump this when config changes
+    local CURRENT_VERSION="4"  # Bump this when config changes
     local NEEDS_UPDATE=false
     local HAS_CONFIG=false
 
@@ -586,6 +646,7 @@ configure_tmux() {
             fi
             echo ""
             echo -e "${BLUE}What's new in this update:${NC}"
+            echo "  • Deliver modified keys in csi-u form so Shift+Enter works (kitty etc.)"
             echo "  • Added extended-keys for Shift+Enter support (tmux 3.2+)"
             echo "  • Fixed mouse scrolling issues on WSL"
             echo "  • Added auto-enter copy-mode on scroll up"
@@ -686,6 +747,9 @@ set -g history-limit 50000
 
 # Extended keys: forward Shift+Enter and other modified keys to apps (tmux 3.2+)
 set -s extended-keys on
+# Deliver them as ESC[13;2u (the kitty keyboard-protocol form Claude Code reads)
+# rather than xterm modifyOtherKeys ESC[27;2;13~, which Claude Code ignores.
+set -s extended-keys-format csi-u
 set -as terminal-features 'tmux-256color:extkeys'
 
 # Mouse support (scroll + drag-to-copy)
@@ -711,6 +775,16 @@ bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel \"$CLI
     echo "$CONFIG_BLOCK" >> "$TMUX_CONF"
 
     echo -e "${GREEN}tmux configured successfully!${NC}"
+
+    # kitty ignores xterm modifyOtherKeys (it only speaks its own CSI-u keyboard
+    # protocol), so tmux can't negotiate Shift+Enter with it. kitty must emit the
+    # sequence itself — we can't edit kitty.conf for the user, so just point it out.
+    if [[ -n "$KITTY_WINDOW_ID" || "$TERM" == "xterm-kitty" || "$TERM_PROGRAM" == "kitty" ]]; then
+        echo ""
+        echo -e "${YELLOW}kitty detected:${NC} for Shift+Enter to insert a newline, add to ~/.config/kitty/kitty.conf:"
+        echo "    map shift+enter send_text all \\x1b[13;2u"
+        echo "  then reload kitty (Ctrl+Shift+F5). See troubleshooting.md."
+    fi
 
     # Reload tmux config if tmux is running
     if tmux list-sessions &> /dev/null; then
@@ -799,4 +873,9 @@ fi
 
 } # end main
 
-main "$@"
+# Run the installer unless the script was sourced purely to load its functions
+# for testing (see internal/releasetests/issue1206_install_checksum_test.go).
+# Unset in normal `curl ... | bash` use, so the installer runs as before.
+if [[ -z "${AGENT_DECK_INSTALL_SH_SOURCE_ONLY:-}" ]]; then
+    main "$@"
+fi

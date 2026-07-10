@@ -35,11 +35,14 @@ type ZoxidePicker struct {
 	errMsg     string
 	unavail    bool // zoxide not installed; results disabled
 	queryFn    zoxideQueryFunc
+	checkAvail bool
 }
 
 // NewZoxidePicker constructs a picker wired to the real zoxide binary.
 func NewZoxidePicker() *ZoxidePicker {
-	return newZoxidePickerWithQueryFn(defaultZoxideQuery)
+	z := newZoxidePickerWithQueryFn(defaultZoxideQuery)
+	z.checkAvail = true
+	return z
 }
 
 func newZoxidePickerWithQueryFn(fn zoxideQueryFunc) *ZoxidePicker {
@@ -69,7 +72,7 @@ func (z *ZoxidePicker) Show() {
 	z.queryInput.CursorEnd()
 	z.queryInput.Focus()
 
-	if !session.ZoxideAvailable() {
+	if z.checkAvail && !session.ZoxideAvailable() {
 		z.unavail = true
 		z.results = nil
 		return
@@ -228,13 +231,5 @@ func (z *ZoxidePicker) renderResults() string {
 }
 
 func (z *ZoxidePicker) dialogWidth() int {
-	const preferred = 70
-	if z.width > 0 && z.width < preferred+10 {
-		w := z.width - 10
-		if w < 40 {
-			w = 40
-		}
-		return w
-	}
-	return preferred
+	return fitDialogWidth(70, 40, z.width)
 }

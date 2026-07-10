@@ -1,12 +1,45 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// TestProjectSkillAttachment_JSONTags guards the web-API contract: the struct
+// must serialize with explicit json keys (lowercase), not Go's PascalCase
+// field-name fallback. Without json tags, /api/sessions/{id}/skills emits
+// {"Name":...} while the frontend + e2e tests read s.name, silently breaking
+// the skills pane. See internal/web/handlers_skills.go.
+func TestProjectSkillAttachment_JSONTags(t *testing.T) {
+	att := ProjectSkillAttachment{
+		ID: "pool/alpha", Name: "alpha", Source: "pool",
+		SourcePath: "/src/alpha", EntryName: "alpha",
+		TargetPath: ".claude/skills/alpha",
+	}
+	raw, err := json.Marshal(att)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, bad := got["Name"]; bad {
+		t.Fatalf("ProjectSkillAttachment marshaled PascalCase key \"Name\" — missing json tags: %s", raw)
+	}
+	if got["name"] != "alpha" {
+		t.Fatalf("expected json key \"name\"=alpha, got: %s", raw)
+	}
+	for _, key := range []string{"id", "source", "source_path", "entry_name", "target_path"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("expected json key %q in output: %s", key, raw)
+		}
+	}
+}
 
 func setupSkillTestEnv(t *testing.T) (string, func()) {
 	t.Helper()
@@ -74,6 +107,54 @@ func TestLoadSkillSources_DefaultsWhenMissing(t *testing.T) {
 	wantClaude := filepath.Join(homeDir, ".claude", "skills")
 	if claude.Path != wantClaude {
 		t.Fatalf("claude source path = %q, want %q", claude.Path, wantClaude)
+	}
+}
+
+func TestGetSkillPoolPath_UsesXDGConfigForNewInstall(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+	xdgConfigHome := filepath.Join(homeDir, "xdg-config")
+	t.Setenv("XDG_CONFIG_HOME", xdgConfigHome)
+
+	got, err := GetSkillPoolPath()
+	if err != nil {
+		t.Fatalf("GetSkillPoolPath failed: %v", err)
+	}
+	want := filepath.Join(xdgConfigHome, "agent-deck", "skills", "pool")
+	if got != want {
+		t.Fatalf("GetSkillPoolPath() = %q, want %q", got, want)
+	}
+}
+
+func TestGetSkillPoolPath_LegacySkillsFallback(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+	xdgConfigHome := filepath.Join(homeDir, "xdg-config")
+	t.Setenv("XDG_CONFIG_HOME", xdgConfigHome)
+	legacySkills := filepath.Join(homeDir, ".agent-deck", "skills")
+	if err := os.MkdirAll(filepath.Join(legacySkills, "pool"), 0o700); err != nil {
+		t.Fatalf("mkdir legacy skills pool: %v", err)
+	}
+
+	got, err := GetSkillPoolPath()
+	if err != nil {
+		t.Fatalf("GetSkillPoolPath failed: %v", err)
+	}
+	want := filepath.Join(legacySkills, "pool")
+	if got != want {
+		t.Fatalf("GetSkillPoolPath() = %q, want legacy %q", got, want)
+	}
+
+	if err := os.MkdirAll(filepath.Join(xdgConfigHome, "agent-deck", "skills"), 0o700); err != nil {
+		t.Fatalf("mkdir XDG skills root: %v", err)
+	}
+	got, err = GetSkillPoolPath()
+	if err != nil {
+		t.Fatalf("GetSkillPoolPath with XDG marker failed: %v", err)
+	}
+	want = filepath.Join(xdgConfigHome, "agent-deck", "skills", "pool")
+	if got != want {
+		t.Fatalf("XDG skills root should win once present: got %q want %q", got, want)
 	}
 }
 

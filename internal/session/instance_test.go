@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
 	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/stretchr/testify/require"
 )
@@ -295,6 +296,43 @@ func TestInstance_CreateForkedInstance(t *testing.T) {
 	}
 	if forked2.GroupPath != "custom-group" {
 		t.Errorf("Forked group = %s, want custom-group", forked2.GroupPath)
+	}
+}
+
+func TestInstance_CreateForkedInstance_PreservesCompatibleToolIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	cfg := &UserConfig{
+		Tools: map[string]ToolDef{
+			"my-claude": {
+				Command:        "claude-wrapper",
+				CompatibleWith: "claude",
+			},
+		},
+	}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	parent := NewInstanceWithTool("cl parent", "/tmp/original", "my-claude")
+	parent.Wrapper = "wrap {command}"
+	parent.ClaudeSessionID = "abc-123"
+	parent.ClaudeDetectedAt = time.Now()
+
+	forked, _, err := parent.CreateForkedInstanceWithOptions("cl parent (fork)", "", nil)
+	if err != nil {
+		t.Fatalf("CreateForkedInstanceWithOptions: %v", err)
+	}
+	if forked.Tool != "my-claude" {
+		t.Fatalf("forked Tool = %q, want custom Claude-compatible tool identity", forked.Tool)
+	}
+	if forked.Wrapper != parent.Wrapper {
+		t.Fatalf("forked Wrapper = %q, want %q", forked.Wrapper, parent.Wrapper)
 	}
 }
 
@@ -1393,6 +1431,7 @@ func TestBuildCodexCommand_CustomWrapperPreservesToolIdentity(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	ClearUserConfigCache()
 
 	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
@@ -1440,6 +1479,7 @@ func TestBuildCodexCommand_UsesConfiguredCommandForBuiltinCodex(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	ClearUserConfigCache()
 	defer ClearUserConfigCache()
 
@@ -1552,6 +1592,7 @@ func TestBuildCodexCommand_ConfiguredCommandResume(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	originalCodexHome := os.Getenv("CODEX_HOME")
 	os.Unsetenv("CODEX_HOME")
 	defer func() {
@@ -1584,6 +1625,7 @@ func TestBuildCodexCommand_ExplicitCommandBeatsConfiguredCommand(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	ClearUserConfigCache()
 	defer ClearUserConfigCache()
 
@@ -1608,6 +1650,7 @@ func TestBuildCodexCommand_InlineCodexHomeForRolloutCheck(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	originalCodexHome := os.Getenv("CODEX_HOME")
 	os.Unsetenv("CODEX_HOME")
 	defer func() {
@@ -1641,6 +1684,7 @@ func TestBuildCodexCommand_QuotedInlineCodexHomeWithSpaces(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	originalCodexHome := os.Getenv("CODEX_HOME")
 	os.Unsetenv("CODEX_HOME")
 	defer func() {
@@ -1692,6 +1736,7 @@ func TestBuildCodexCommand_InlineCodexHomeDropsStaleID(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	originalCodexHome := os.Getenv("CODEX_HOME")
 	os.Unsetenv("CODEX_HOME")
 	defer func() {
@@ -1732,6 +1777,38 @@ func TestBuildCodexCommand_InlineCodexHomeDropsStaleID(t *testing.T) {
 	}
 	if got := ReadHookSessionAnchor(inst.ID); got != "" {
 		t.Fatalf(".sid anchor should be cleared after stale-id drop, got %q", got)
+	}
+}
+
+func TestCanRestartCursor(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	inst := NewInstanceWithTool("cursor-restart-test", "/tmp", "cursor")
+	inst.Command = "sleep 60"
+	err := inst.Start()
+	if err != nil {
+		t.Fatalf("Failed to start session: %v", err)
+	}
+	defer func() { _ = inst.Kill() }()
+
+	inst.Status = StatusRunning
+
+	if !inst.CanRestart() {
+		t.Fatal("CanRestart() should return true for a running Cursor session with live tmux pane")
+	}
+
+	// Simulate persisted command from a real Cursor session before restart.
+	inst.Command = "cursor agent"
+
+	if err := inst.Restart(); err != nil {
+		t.Fatalf("Restart failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if inst.tmuxSession == nil || !inst.tmuxSession.Exists() {
+		t.Fatal("tmux session should exist after Restart")
+	}
+	if inst.Status == StatusError {
+		t.Fatalf("after Restart, Status = %s; want != error", inst.Status)
 	}
 }
 
@@ -1901,6 +1978,7 @@ func TestBuildCodexCommand_UsesProfileCodexConfigDirAsCodexHome(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	_ = os.Setenv("HOME", tmpDir)
 	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	isolateConfigHomeXDG(t)
 	originalCodexHome := os.Getenv("CODEX_HOME")
 	_ = os.Unsetenv("CODEX_HOME")
 	defer func() {
@@ -1948,6 +2026,7 @@ func TestBuildCodexCommand_CreatesMissingExplicitCodexHomeDir(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	_ = os.Setenv("HOME", tmpDir)
 	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	isolateConfigHomeXDG(t)
 	originalCodexHome := os.Getenv("CODEX_HOME")
 	_ = os.Unsetenv("CODEX_HOME")
 	defer func() {
@@ -2004,6 +2083,7 @@ func TestCanRestart_CustomCodexWrapperWithKnownID(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 	ClearUserConfigCache()
 
 	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
@@ -2234,6 +2314,24 @@ func TestInstance_CanFork_OpenCode(t *testing.T) {
 	}
 }
 
+func TestInstance_CanFork_Pi(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	inst := NewInstanceWithTool("test", "/tmp/test", "pi")
+	if inst.CanFork() {
+		t.Error("CanFork() should be false for local Pi sessions before a source JSONL exists")
+	}
+
+	seedLocalPiSessionFile(t, inst)
+	if !inst.CanFork() {
+		t.Error("CanFork() should be true for Pi sessions with Agent Deck Pi JSONL history")
+	}
+
+	inst.ID = ""
+	if inst.CanFork() {
+		t.Error("CanFork() should be false for Pi without an Agent Deck instance ID")
+	}
+}
+
 func TestInstance_CanRestartFresh(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2364,6 +2462,35 @@ func TestInstance_ForkOpenCode(t *testing.T) {
 	// tmux set-environment removed: host-side SetEnvironment handles propagation
 	if strings.Contains(script, "tmux set-environment") {
 		t.Errorf("Fork script should NOT contain tmux set-environment (host-side handles it), got: %s", script)
+	}
+}
+
+func TestInstance_ForkOpenCode_QuotesScriptInputs(t *testing.T) {
+	workDir := filepath.Join(t.TempDir(), `project with "quote"`)
+	inst := NewInstanceWithTool("test", workDir, "opencode")
+	inst.OpenCodeSessionID = "ses_abc123"
+	inst.OpenCodeDetectedAt = time.Now()
+
+	cmd, err := inst.ForkOpenCode("forked-test", "")
+	if err != nil {
+		t.Fatalf("ForkOpenCode() failed: %v", err)
+	}
+	scriptPath := strings.TrimPrefix(cmd, "bash '")
+	scriptPath = strings.TrimSuffix(scriptPath, "'")
+	scriptContent, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("Failed to read fork script at %s: %v", scriptPath, err)
+	}
+	script := string(scriptContent)
+
+	if strings.Contains(script, fmt.Sprintf(`cd "%s"`, workDir)) {
+		t.Fatalf("workDir must not be interpolated inside double quotes: %s", script)
+	}
+	if want := "cd " + shellescape.Quote(workDir); !strings.Contains(script, want) {
+		t.Fatalf("fork script should quote workDir with shellescape; want %q in %s", want, script)
+	}
+	if want := "opencode export " + shellescape.Quote(inst.OpenCodeSessionID); !strings.Contains(script, want) {
+		t.Fatalf("fork script should quote OpenCode session ID; want %q in %s", want, script)
 	}
 }
 
@@ -3337,11 +3464,22 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 		t.Fatalf("cooldown should keep %q, got %q", sessionID1, inst.CodexSessionID)
 	}
 
-	// After cooldown, scan should run and pick the newer rotated session.
+	// After cooldown, a known session ID should still not trigger historical
+	// disk-scan rebinding. Rotation is handled by hook payloads or live process
+	// file probes, not by periodically walking all old Codex transcripts.
+	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
+	inst.UpdateCodexSession(nil)
+	if inst.CodexSessionID != sessionID1 {
+		t.Fatalf("post-cooldown known ID should keep %q, got %q", sessionID1, inst.CodexSessionID)
+	}
+
+	// If the binding is genuinely missing, bootstrap scan still works and picks
+	// the newest matching session.
+	inst.CodexSessionID = ""
 	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
 	inst.UpdateCodexSession(nil)
 	if inst.CodexSessionID != sessionID2 {
-		t.Fatalf("post-cooldown scan picked %q, want %q", inst.CodexSessionID, sessionID2)
+		t.Fatalf("bootstrap scan picked %q, want %q", inst.CodexSessionID, sessionID2)
 	}
 }
 

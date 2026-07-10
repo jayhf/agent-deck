@@ -19,11 +19,15 @@ import (
 
 // Config defines runtime options for the web server.
 type Config struct {
-	ListenAddr          string
-	Profile             string
-	ReadOnly            bool
-	WebMutations        bool // When false, POST/PATCH/DELETE endpoints return 403
-	Token               string
+	ListenAddr   string
+	Profile      string
+	ReadOnly     bool
+	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
+	Token        string
+	// InsecureBind explicitly acknowledges binding a non-loopback address
+	// with no auth token (an unauthenticated RCE surface). Without it the
+	// server refuses to start in that configuration. See bind.go / report #1.
+	InsecureBind        bool
 	MenuData            MenuDataLoader
 	PushVAPIDPublicKey  string
 	PushVAPIDPrivateKey string
@@ -103,6 +107,8 @@ type SessionMutator interface {
 	// CloseSession stops the session process while keeping its metadata
 	// in storage (TUI Shift+D — non-destructive close).
 	CloseSession(sessionID string) error
+	ArchiveSession(sessionID string) error
+	UnarchiveSession(sessionID string) error
 	ForkSession(sessionID string) (string, error)
 	// UndoDelete restores the most-recently deleted session if it was
 	// deleted within the implementation's undo window. Returns the
@@ -110,6 +116,14 @@ type SessionMutator interface {
 	// when the stack is empty and ErrUndoExpired when the most recent
 	// entry is older than the window — the handler maps both to 404.
 	UndoDelete() (string, error)
+	// UpdateSession applies one or more field edits to a session. updates maps
+	// session.Field* constants (raw strings — see internal/session/mutators.go)
+	// to their string-encoded new values; bools are "true"/"false". Returns the
+	// list of fields that actually changed (a no-op subset is permitted; only
+	// fields whose new value differs from the stored value are reported) and
+	// whether any updated field requires a restart to take effect. Validation
+	// errors (unknown field, invalid value) leave the session unchanged.
+	UpdateSession(sessionID string, updates map[string]string) (updatedFields []string, restartRequired bool, err error)
 	CreateGroup(name, parentPath string) (string, error)
 	RenameGroup(groupPath, newName string) error
 	DeleteGroup(groupPath string) error
@@ -158,11 +172,17 @@ func NewServer(cfg Config) *Server {
 		menuData = NewSessionDataService(cfg.Profile)
 	}
 
+	mutationLimiter := rate.NewLimiter(rate.Limit(20), 40) // 20 req/s, burst 40
+	if cfg.Profile == "fixture" {
+		// Playwright e2e hammers mutations across 400+ serial cases on one
+		// process; production limits would flake skills/mcps/session specs.
+		mutationLimiter = rate.NewLimiter(rate.Inf, 0)
+	}
 	s := &Server{
 		cfg:              cfg,
 		menuData:         menuData,
 		menuSubscribers:  make(map[chan struct{}]struct{}),
-		mutationLimiter:  rate.NewLimiter(rate.Limit(20), 40), // 20 req/s, burst 40
+		mutationLimiter:  mutationLimiter,
 		hookStatusLoader: defaultLoadHookStatuses,
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
@@ -186,12 +206,17 @@ func NewServer(cfg Config) *Server {
 		}
 
 		resp := map[string]any{
-			"ok":           true,
-			"profile":      cfg.Profile,
-			"readOnly":     cfg.ReadOnly,
-			"webMutations": cfg.WebMutations,
-			"version":      buildVersion(),
-			"time":         time.Now().UTC().Format(time.RFC3339),
+			"ok":   true,
+			"time": time.Now().UTC().Format(time.RFC3339),
+		}
+		// Report #6: only disclose profile/version/mode detail to authorized
+		// callers. When no token is configured (default loopback dev) every
+		// request is authorized, so behavior is unchanged for normal users.
+		if s.authorizeRequest(r) {
+			resp["profile"] = cfg.Profile
+			resp["readOnly"] = cfg.ReadOnly
+			resp["webMutations"] = cfg.WebMutations
+			resp["version"] = buildVersion()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -204,6 +229,7 @@ func NewServer(cfg Config) *Server {
 	// ServeMux precedence routes it cleanly instead of treating
 	// "undelete" as a sessionID.
 	mux.HandleFunc("POST /api/sessions/undelete", s.handleSessionUndelete)
+	mux.HandleFunc("/api/sessions/archived", s.handleArchivedSessions)
 	mux.HandleFunc("/api/sessions/", s.handleSessionByAction)
 	mux.HandleFunc("/api/groups", s.handleGroupsCollection)
 	mux.HandleFunc("/api/groups/", s.handleGroupByPath)
@@ -215,6 +241,13 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/push/presence", s.handlePushPresence)
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
+
+	// Command Center (the embedded live fleet god-view — see
+	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
+	// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
+	mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
+	mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
+	mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
 
 	mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
 	mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
@@ -238,7 +271,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 
-	handler := withRecover(csrfProtect(mux))
+	handler := withRecover(s.csrfProtect(mux))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -264,6 +297,12 @@ func (s *Server) Handler() http.Handler {
 // Start starts the HTTP server and blocks until shutdown or error.
 // Returns nil on graceful shutdown.
 func (s *Server) Start() error {
+	// Defense-in-depth: refuse to bind an unauthenticated non-loopback
+	// address even if a caller bypassed the CLI flag check. See report #1.
+	if err := s.checkBindSecurity(); err != nil {
+		return err
+	}
+
 	webLog := logging.ForComponent(logging.CompWeb)
 	if watcher, err := session.NewStatusFileWatcher(func() {
 		s.notifyMenuChanged()
@@ -390,6 +429,15 @@ func (s *Server) notifyMenuChanged() {
 		}
 	}
 	s.menuSubscribersMu.Unlock()
+
+	// Invalidate the MemoryMenuData cache so the next LoadMenuSnapshot()
+	// reloads from the storage-backed fallback. In headless (--no-tui) mode
+	// there is no TUI loop to call publishWebMenuSnapshot(), so without this
+	// the menu snapshot would remain frozen at its first-load state and new
+	// sessions created via the API would never appear until server restart.
+	if mmd, ok := s.menuData.(*MemoryMenuData); ok {
+		mmd.InvalidateCache()
+	}
 }
 
 // checkMutationsAllowed writes a 403 response and returns false when web mutations are disabled.

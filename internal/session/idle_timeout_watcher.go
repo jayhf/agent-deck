@@ -48,11 +48,11 @@ var sessionLifecycleLogMu sync.Mutex
 // Distinct from session-id-lifecycle.jsonl (which logs bind/rebind), this
 // covers process-level lifecycle decisions like idle-timeout-expired.
 func GetSessionLifecycleLogPath() string {
-	agentDeckDir, err := GetAgentDeckDir()
+	path, err := logDataPath("session-lifecycle.jsonl")
 	if err != nil {
-		return filepath.Join(os.TempDir(), ".agent-deck", "logs", "session-lifecycle.jsonl")
+		return tempAgentDeckPath("logs", "session-lifecycle.jsonl")
 	}
-	return filepath.Join(agentDeckDir, "logs", "session-lifecycle.jsonl")
+	return path
 }
 
 // WriteSessionLifecycleEvent appends a single JSONL row.
@@ -153,6 +153,16 @@ func (w *IdleTimeoutWatcher) Tick(instances []*Instance) {
 	now := w.cfg.Now()
 	for _, inst := range instances {
 		if inst == nil {
+			continue
+		}
+		if inst.Pin != PinNone {
+			// pin-protects-from-stop: a pinned session is exempt from idle
+			// auto-stop. Drop tracking so unpinning re-arms cleanly next tick.
+			delete(w.lastSeen, inst.ID)
+			idleLog.Debug("idle_timeout_skip_pinned",
+				slog.String("instance_id", inst.ID),
+				slog.String("pin", string(inst.Pin)),
+			)
 			continue
 		}
 		if inst.IdleTimeoutSecs <= 0 {
